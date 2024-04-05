@@ -23,6 +23,11 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 
+from scipy.spatial.transform import Rotation
+import open3d as o3d
+import torch
+import pandas as pd
+
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -265,7 +270,154 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+def build_tum_poses_from_df(df: pd.DataFrame, zero_origin=False):
+    data = torch.from_numpy(df.to_numpy(dtype=np.float64))
+
+    ts = data[:,0]
+    xyz = data[:,1:4]
+    quat = data[:,4:]
+
+    rots = torch.from_numpy(Rotation.from_quat(quat).as_matrix())
+    
+    poses = torch.cat((rots, xyz.unsqueeze(2)), dim=2)
+
+    homog = torch.Tensor([0,0,0,1]).tile((poses.shape[0], 1, 1)).to(poses.device)
+
+    poses = torch.cat((poses, homog), dim=1)
+
+    if zero_origin:
+        rot_inv = poses[0,:3,:3].T
+        t_inv = -rot_inv @ poses[0,:3,3]
+        start_inv = torch.hstack((rot_inv, t_inv.reshape(-1, 1)))
+        start_inv = torch.vstack((start_inv, torch.tensor([0,0,0,1.0], device=start_inv.device)))
+        poses = start_inv.unsqueeze(0) @ poses
+
+    return poses.float(), ts
+
+def readTUMInfo(path, eval):
+    folder_name = os.path.basename(path)
+        
+    traj_file = os.path.join(path, 'groundtruth.txt')
+    ground_truth_df = pd.read_csv(traj_file, names=["timestamp","x","y","z","q_x","q_y","q_z","q_w"], delimiter=" ")
+    ground_truth_df = ground_truth_df.drop(ground_truth_df[(ground_truth_df.timestamp == '#')].index)
+    poses, timestamps = build_tum_poses_from_df(ground_truth_df, False)
+    ts_pose = np.asarray([t for t in timestamps])
+
+    image_ts_file = os.path.join(path, 'rgb.txt')
+    depth_ts_file = os.path.join(path, 'depth.txt')
+    image_data = np.loadtxt(image_ts_file, delimiter=' ', dtype=np.unicode_, skiprows=0)
+    depth_data = np.loadtxt(depth_ts_file, delimiter=' ', dtype=np.unicode_, skiprows=0)
+    ts_image = image_data[:, 0].astype(np.float64)
+    ts_depth = depth_data[:, 0].astype(np.float64)
+    
+    TUM_FPS=30
+    max_dt = 1.0 / TUM_FPS *  1.1
+
+    associations = []
+    ts_interval = 0.5 # (s)
+    last_ts = None
+    for img_idx, img_ts in enumerate(ts_image):
+        depth_idx = np.argmin(np.abs(ts_depth - img_ts))
+        pose_idx = np.argmin(np.abs(ts_pose - img_ts))
+
+        if (np.abs(ts_depth[depth_idx] - img_ts) < max_dt) and \
+                (np.abs(ts_pose[pose_idx] - img_ts) < max_dt):
+            if last_ts !=None and (img_ts-last_ts < ts_interval):
+                continue
+            else:
+                last_ts = img_ts
+            associations.append((img_idx, depth_idx, pose_idx))
+    
+    # associations = associations[:1] # ONLY USE FIRST FRAME FOR TRAINING !!!!!!!!!!!!!!!!!!!!
+    associations = associations[1:] # SKIP FIRST FRAME FOR TRAINING !!!!!!!!!!!!!!!!!!!!
+    
+    cam_infos = []
+    test_cam_infos = []
+    mat_list = []
+    pc_init = np.zeros((0,3))
+    color_init = np.zeros((0,3))
+    
+    height = 480
+    width = 640
+    if 'freiburg1' in folder_name:
+        print("Detect freiburg1. Use freiburg1 intrinsic.")
+        fx, fy, cx, cy = 517.3, 516.5, 318.6, 255.3
+    elif 'freiburg2' in folder_name:
+        print("Detect freiburg2. Use freiburg2 intrinsic.")
+        fx, fy, cx, cy = 520.9, 521.0, 325.1, 249.7
+    elif 'freiburg3' in folder_name:
+        print("Detect freiburg3. Use freiburg3 intrinsic.")
+        fx, fy, cx, cy = 535.4, 539.2, 320.1, 247.6
+    depth_scale = 5000.
+    
+    FovY = focal2fov(fy, height) # check where to incoorporate cx, cy
+    FovX = focal2fov(fx, width)
+
+    for count_idx, (img_idx, depth_idx, pose_idx) in enumerate(associations):
+        print(count_idx)
+        mat = np.array(poses[pose_idx])
+        mat_list.append(mat)
+        R = mat[:3,:3]
+        T = mat[:3, 3]        
+        # Invert
+        T = -R.T @ T # convert from real world to GS format: R=R, T=T.inv()
+        
+        image_path = f"{path}/"+image_data[img_idx][1]
+        depth_path = f"{path}/"+depth_data[depth_idx][1]
+        temp = Image.open(image_path)
+        image = temp.copy()
+        temp = Image.open(depth_path)
+        depth = temp.copy()
+        temp.close()
+        
+        ### TODO: long range filter
+        # max_depth = 1.5
+        # depth_far_mask = (np.array(depth)/depth_scale>max_depth)
+        # depth = np.array(depth)
+        # depth[depth_far_mask] = 0
+        # depth = Image.fromarray(depth)
+        ###
+        
+        depth_scaled = Image.fromarray(np.array(depth) / depth_scale * 255.0)
+
+        image_name = os.path.basename(image_path).split(".png")[0]
+
+
+        o3d_depth = o3d.geometry.Image(np.array(depth).astype(np.float32))
+        o3d_image = o3d.geometry.Image(np.array(image).astype(np.uint8))
+        o3d_intrinsic = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy) # w, h, fx, fy, cx, cy
+
+        rgbd_img = o3d.geometry.RGBDImage.create_from_color_and_depth(o3d_image, o3d_depth, depth_scale=depth_scale, depth_trunc=1000, convert_rgb_to_intensity=False)
+        o3d_pc = o3d.geometry.PointCloud.create_from_rgbd_image(image=rgbd_img, intrinsic=o3d_intrinsic, extrinsic=np.identity(4))
+        o3d_pc = o3d_pc.transform(mat)
+
+        # o3d.visualization.draw_geometries([o3d_pc])
+
+        cam_info = CameraInfo(uid=count_idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                            image_path=image_path, image_name=image_name, width=width, height=height,
+                            )
+        cam_infos.append(cam_info)
+    
+    train_cam_infos = cam_infos
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "points3d.ply")
+    try:
+        pcd = fetchPly(ply_path)
+        print('read: ', pcd.points.shape)
+    except:
+        pcd = None
+    
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "TUM" : readTUMInfo
 }

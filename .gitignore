@@ -10,3 +10,8 @@ tensorboard_3d
 events.out*
 ckpt
 release
+
+ckpts
+download
+eval_result
+segment-anything-langsplat

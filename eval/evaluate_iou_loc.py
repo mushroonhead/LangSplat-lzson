@@ -94,7 +94,10 @@ def activate_stream(sem_map,
                     img_ann: Dict = None, 
                     thresh : float = 0.5, 
                     colormap_options = None):
+    # print(sem_map.shape) # [3, 730, 988, 512]
     valid_map = clip_model.get_max_across(sem_map)                 # 3xkx832x1264
+    # print(valid_map.shape) # [3, 11, 730, 988] # image size: 730, 988
+    
     n_head, n_prompt, h, w = valid_map.shape
 
     # positive prompts
@@ -110,6 +113,11 @@ def activate_stream(sem_map,
             avg_filtered = cv2.filter2D(np_relev, -1, kernel)
             avg_filtered = torch.from_numpy(avg_filtered).to(valid_map.device)
             valid_map[i][k] = 0.5 * (avg_filtered + valid_map[i][k])
+            
+            # import matplotlib.pyplot as plt
+            # plt.imshow(valid_map[i][k].cpu())
+            # plt.axis('off')  # Turn off axis
+            # plt.show()
             
             output_path_relev = image_name / 'heatmap' / f'{clip_model.positives[k]}_{i}'
             output_path_relev.parent.mkdir(exist_ok=True, parents=True)
@@ -162,7 +170,7 @@ def activate_stream(sem_map,
 def lerf_localization(sem_map, image, clip_model, image_name, img_ann):
     output_path_loca = image_name / 'localization'
     output_path_loca.mkdir(exist_ok=True, parents=True)
-
+    # print(sem_map.shape) # (3, 730, 988, 512)
     valid_map = clip_model.get_max_across(sem_map)                 # 3xkx832x1264
     n_head, n_prompt, h, w = valid_map.shape
     
@@ -211,6 +219,12 @@ def lerf_localization(sem_map, image, clip_model, image_name, img_ann):
         mask = (torch_relev < 0.5).squeeze()
         valid_composited[mask, :] = image[mask, :] * 0.3
         
+        # print(valid_composited.shape)
+        # import matplotlib.pyplot as plt
+        # plt.imshow(valid_composited.cpu())
+        # plt.axis('off')  # Turn off axis
+        # plt.show()
+        
         save_path = output_path_loca / f"{positives[k]}.png"
         show_result(valid_composited.cpu().numpy(), coord_final,
                     img_ann[positives[k]]['bboxes'], save_path)
@@ -227,17 +241,20 @@ def evaluate(feat_dir, output_path, ae_ckpt_path, json_folder, mask_thresh, enco
         colormap_max=1.0,
     )
 
+    print('feat_dir: ', feat_dir)
     gt_ann, image_shape, image_paths = eval_gt_lerfdata(Path(json_folder), Path(output_path))
     eval_index_list = [int(idx) for idx in list(gt_ann.keys())]
     compressed_sem_feats = np.zeros((len(feat_dir), len(eval_index_list), *image_shape, 3), dtype=np.float32)
     for i in range(len(feat_dir)):
         feat_paths_lvl = sorted(glob.glob(os.path.join(feat_dir[i], '*.npy')),
                                key=lambda file_name: int(os.path.basename(file_name).split(".npy")[0]))
+        
         for j, idx in enumerate(eval_index_list):
             compressed_sem_feats[i][j] = np.load(feat_paths_lvl[idx])
 
     # instantiate autoencoder and openclip
     clip_model = OpenCLIPNetwork(device)
+    print('ae_ckpt_path: ', ae_ckpt_path)
     checkpoint = torch.load(ae_ckpt_path, map_location=device)
     model = Autoencoder(encoder_hidden_dims, decoder_hidden_dims).to(device)
     model.load_state_dict(checkpoint)
@@ -259,9 +276,9 @@ def evaluate(feat_dir, output_path, ae_ckpt_path, json_folder, mask_thresh, enco
             lvl, h, w, _ = sem_feat.shape
             restored_feat = model.decode(sem_feat.flatten(0, 2))
             restored_feat = restored_feat.view(lvl, h, w, -1)           # 3x832x1264x512
-        
+        # print(restored_feat.shape)
         img_ann = gt_ann[f'{idx}']
-        clip_model.set_positives(list(img_ann.keys()))
+        clip_model.set_positives(list(img_ann.keys())) # Loading query texts to the clip model 
         
         c_iou_list, c_lvl = activate_stream(restored_feat, rgb_img, clip_model, image_name, img_ann,
                                             thresh=mask_thresh, colormap_options=colormap_options)
@@ -326,7 +343,7 @@ if __name__ == "__main__":
     mask_thresh = args.mask_thresh
     feat_dir = [os.path.join(args.feat_dir, dataset_name+f"_{i}", "train/ours_None/renders_npy") for i in range(1,4)]
     output_path = os.path.join(args.output_dir, dataset_name)
-    ae_ckpt_path = os.path.join(args.ae_ckpt_dir, dataset_name, "ae_ckpt/best_ckpt.pth")
+    ae_ckpt_path = args.ae_ckpt_dir
     json_folder = os.path.join(args.json_folder, dataset_name)
 
     # NOTE logger

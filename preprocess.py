@@ -122,6 +122,10 @@ def create(image_list, data_list, save_folder):
 
     for i, img in tqdm(enumerate(image_list), desc="Embedding images", leave=False):
         timer += 1
+        
+        # if i < 12:
+        #     continue
+        
         try:
             img_embed, seg_map = _embed_clip_sam_tiles(img.unsqueeze(0), sam_encoder)
         except:
@@ -159,7 +163,7 @@ def create(image_list, data_list, save_folder):
     mask_generator.predictor.model.to('cpu')
         
     for i in range(img_embeds.shape[0]):
-        save_path = os.path.join(save_folder, data_list[i].split('.')[0])
+        save_path = os.path.join(save_folder, data_list[i].split('.png')[0]) # .split('.')
         assert total_lengths[i] == int(seg_maps[i].max() + 1)
         curr = {
             'feature': img_embeds[i, :total_lengths[i]],
@@ -174,6 +178,12 @@ def sava_numpy(save_path, data):
     np.save(save_path_f, data['feature'].numpy())
 
 def _embed_clip_sam_tiles(image, sam_encoder):
+    
+    # from matplotlib import pyplot as plt
+    # plt.imshow(image.squeeze().permute(1, 2, 0).cpu())
+    # plt.axis('off')
+    # plt.show()
+
     aug_imgs = torch.cat([image])
     seg_images, seg_map = sam_encoder(aug_imgs)
 
@@ -307,7 +317,13 @@ def sam_encoder(image):
         for i in range(len(masks)):
             mask = masks[i]
             seg_img = get_seg_img(mask, image)
-            pad_seg_img = cv2.resize(pad_img(seg_img), (224,224))
+            seg_size = seg_img.shape[0] * seg_img.shape[1]
+
+            if seg_size>0:
+                pad_seg_img = cv2.resize(pad_img(seg_img), (224,224))
+            else:
+                pad_seg_img = np.zeros((224,224,3))
+
             seg_img_list.append(pad_seg_img)
 
             seg_map[masks[i]['segmentation']] = i
@@ -317,6 +333,10 @@ def sam_encoder(image):
         return seg_imgs, seg_map
 
     seg_images, seg_maps = {}, {}
+    
+    # print('masks_default: ', len(masks_default))
+    # print(image.shape)
+    
     seg_images['default'], seg_maps['default'] = mask2segmap(masks_default, image)
     if len(masks_s) != 0:
         seg_images['s'], seg_maps['s'] = mask2segmap(masks_s, image)
