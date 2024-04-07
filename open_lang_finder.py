@@ -23,16 +23,18 @@ device = torch.device('cuda:0')
 
 def getWorld2View2(R : torch.Tensor, t: torch.Tensor, 
                    translate=torch.zeros(3), scale=1.0) -> torch.Tensor:
+    batch_size = R.shape[0]
     Rt = torch.cat(
         (torch.cat((R.transpose(-1,-2), t[...,None]), dim=-1),
-        torch.cat((torch.zeros_like(t[...,None,:]),torch.ones_like(t[...,-1][...,None,None])), dim=-1)),
+        torch.cat((torch.zeros_like(t[...,None,:]),torch.ones(batch_size, 1, 1, device=R.device)), dim=-1)),
         dim=-2)
+    Rt = Rt.double()
 
-    C2W = torch.linalg.solve(Rt, torch.eye(4, device=R.device)) # higher precision inversion
+    C2W = torch.linalg.solve(Rt, torch.eye(4, device=R.device, dtype=torch.float64)) # higher precision inversion
     cam_center = C2W[...,:3, 3]
     cam_center = (cam_center + translate.to(device=R.device, dtype=torch.float64)) * scale
     C2W[...,:3, 3] = cam_center
-    Rt = torch.linalg.solve(C2W, torch.eye(4, device=R.device))
+    Rt = torch.linalg.solve(C2W, torch.eye(4, device=R.device, dtype=torch.float64))
     return Rt.to(dtype=R.dtype), C2W[...,3,:3].to(dtype=R.dtype) # back to original precision
 
 
@@ -48,7 +50,7 @@ class ImageRelevancyPipeline(torch.nn.Module):
         super().__init__()
         # init gaussian and attached scene details
         self.gaussian = GaussianModel(dataset_params.sh_degree)
-        self.scene = Scene(dataset_params, gaussians, shuffle=False)
+        self.scene = Scene(dataset_params, self.gaussian, shuffle=False)
         (model_params, first_iter) = torch.load(os.path.join(args.model_path, 'chkpnt30000.pth'))
         # set default camera properties (assume first of train set for now)
         try:
@@ -77,9 +79,9 @@ class ImageRelevancyPipeline(torch.nn.Module):
         # set query
         self.clip_model.set_positives([query])
         # render gaussian and keep features only
-        _, encoded_lang_feat, _ = self.render_gaussian(R, t,
-                                                   pipeline_params=pipeline_params,
-                                                   scaling_modifier=scaling_modifier, override_color=override_color)
+        _, encoded_lang_feat, _, _ = self.render_gaussian(R, t,
+                                                          pipeline_params=pipeline_params,
+                                                          scaling_modifier=scaling_modifier, override_color=override_color)
         # split decoding of datasedue to la dimension
         all_valid_map = []
         full_batch_size = encoded_lang_feat.shape[0]
@@ -101,7 +103,8 @@ class ImageRelevancyPipeline(torch.nn.Module):
         gaussian = self.gaussian
 
         # calculate view mat and cam center
-        view_mat, cam_center = getWorld2View2(R, t).transpose(-1,-2)
+        view_mat, cam_center = getWorld2View2(R, t)
+        view_mat = view_mat.transpose(-1,-2)
 
         all_rendered_image = []
         all_language_feature_image = []
@@ -115,7 +118,7 @@ class ImageRelevancyPipeline(torch.nn.Module):
                 image_width=int(self.image_width),
                 tanfovx=self.tanfovx,
                 tanfovy=self.tanfovy,
-                bg=bg_color,
+                bg=self.background,
                 scale_modifier=scaling_modifier,
                 viewmatrix=view_mat_i,
                 projmatrix=self.proj_mat,
@@ -170,22 +173,22 @@ class ImageRelevancyPipeline(torch.nn.Module):
             language_feature_precomp = gaussian.get_language_feature
             language_feature_precomp = language_feature_precomp/ (language_feature_precomp.norm(dim=-1, keepdim=True) + 1e-9)
                 
-            # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+            # Rasterize visible Gaussians to image, obtain their radii (on screen).
             rendered_image, language_feature_image, radii = rasterizer(
-                means3D = means3D,
-                means2D = means2D,
-                shs = shs,
+                means3D = means3D.float(),
+                means2D = means2D.float(),
+                shs = shs.float(),
                 colors_precomp = colors_precomp,
-                language_feature_precomp = language_feature_precomp,
-                opacities = opacity,
-                scales = scales,
-                rotations = rotations,
+                language_feature_precomp = language_feature_precomp.float(),
+                opacities = opacity.float(),
+                scales = scales.float(),
+                rotations = rotations.float(),
                 cov3D_precomp = cov3D_precomp)
             
             all_rendered_image.append(rendered_image)
             all_language_feature_image.append(language_feature_image)
             all_radii.append(radii)
-            all_screenspace_points.append(all_screenspace_points)
+            all_screenspace_points.append(screenspace_points)
 
         return (torch.stack(all_rendered_image).permute(0,2,3,1), 
                 torch.stack(all_language_feature_image).permute(0,2,3,1), 
@@ -206,44 +209,31 @@ if __name__ == "__main__":
     parser.add_argument("--include_feature", action="store_true")
     args = get_combined_args(parser)
 
+    # device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # load model from dataset
     dataset = model.extract(args)
     pipeline_params = pipeline.extract(args)
 
-    # load gaussian
-    gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, shuffle=False)
-    checkpoint = os.path.join(args.model_path, 'chkpnt30000.pth')
-    (model_params, first_iter) = torch.load(checkpoint)
-    gaussians.restore(model_params, args, mode='test')
-
-    # set background
-    bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
     # Autoencoder to decode
-    checkpoint = torch.load(ae_ckpt_path, map_location=device)
-    model = Autoencoder(encoder_hidden_dims, decoder_hidden_dims).to(device)
-    model.load_state_dict(checkpoint)
-    model.eval()
+    ae_chkpt = torch.load(ae_ckpt_path, map_location=device)
 
-    # CLIP encoder
+    # load pipeline
+    pipeline = ImageRelevancyPipeline(
+        dataset_params=dataset,
+        encoder_hidden_dims=encoder_hidden_dims, decoder_hidden_dims=decoder_hidden_dims,
+        auto_encoder_chkpt=ae_chkpt,
+        device=device
+    )
+
     queries = ['pikachu','gundam'] #N queries
 
-    clip_model = OpenCLIPNetwork(device)
-    clip_model.set_positives(queries)
-
-    # render
+    # render with no grad
     with torch.no_grad():
-        cam = scene.getTrainCameras()[0]
-        output = render(cam, gaussians, pipeline_params, background, args)
-        encoded_lang_feat = output['language_feature_image'].permute(1,2,0)
-        decoded_lang_feat = model.decode(encoded_lang_feat)
-        valid_map = clip_model.get_max_across(decoded_lang_feat[None,...]) # (levels, num_queries, height, width)
-        n_head, n_prompt, h, w = valid_map.shape
-        print(output['render'].shape, output['language_feature_image'].shape, decoded_lang_feat.shape, valid_map.shape)
-        fig, axs = plt.subplots(1,2, figsize=(6,12))
-        # axs[0].imshow(output['render'].permute(1,2,0).cpu().numpy())
-        axs[0].imshow(valid_map[0,0,...].cpu().numpy())
-        axs[1].imshow(output['language_feature_image'].permute(1,2,0).cpu().numpy())
-        plt.show()
+        cam = pipeline.scene.getTrainCameras()[0] # temporary get 1
+        R = torch.as_tensor(cam.R[None,...], device=device, dtype=torch.float32)
+        t = torch.as_tensor(cam.T[None,...], device=device, dtype=torch.float32)
+        valid_map = pipeline(queries[0], R, t, pipeline_params)
+        plt.imshow(valid_map[0,...].squeeze(0).detach().cpu().numpy())
+        pass
