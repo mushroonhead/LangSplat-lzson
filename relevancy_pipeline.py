@@ -10,22 +10,7 @@ from eval.openclip_encoder import OpenCLIPNetwork
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from utils.graphics_utils import getProjectionMatrix
 from utils.sh_utils import eval_sh
-
-def getWorld2View2(R : torch.Tensor, t: torch.Tensor, 
-                   translate=torch.zeros(3), scale=1.0) -> torch.Tensor:
-    batch_size = R.shape[0]
-    Rt = torch.cat(
-        (torch.cat((R.transpose(-1,-2), t[...,None]), dim=-1),
-        torch.cat((torch.zeros_like(t[...,None,:]),torch.ones(batch_size, 1, 1, device=R.device)), dim=-1)),
-        dim=-2)
-    Rt = Rt.double()
-
-    C2W = torch.linalg.solve(Rt, torch.eye(4, device=R.device, dtype=torch.float64)) # higher precision inversion
-    cam_center = C2W[...,:3, 3]
-    cam_center = (cam_center + translate.to(device=R.device, dtype=torch.float64)) * scale
-    C2W[...,:3, 3] = cam_center
-    Rt = torch.linalg.solve(C2W, torch.eye(4, device=R.device, dtype=torch.float64))
-    return Rt.to(dtype=R.dtype), C2W[...,3,:3].to(dtype=R.dtype) # back to original precision
+from utils.spatial_tensor_utils import getWorld2View2
 
 
 class ImageRelevancyPipeline(torch.nn.Module):
