@@ -155,10 +155,10 @@ def getWorld2View2(R : torch.Tensor, t: torch.Tensor,
         - Rt: (...,3,3) tensor, transpose rotation of cam?
         - C2W: (...,3) tensor, camera to world frame translation
     """
-    batch_size = R.shape[0]
+    batch_size = R.shape[:-2]
     Rt = torch.cat(
         (torch.cat((R.transpose(-1,-2), t[...,None]), dim=-1),
-        torch.cat((torch.zeros_like(t[...,None,:]),torch.ones(batch_size, 1, 1, device=R.device)), dim=-1)),
+        torch.cat((torch.zeros_like(t[...,None,:]),torch.ones(*batch_size, 1, 1, device=R.device)), dim=-1)),
         dim=-2)
     Rt = Rt.double()
 

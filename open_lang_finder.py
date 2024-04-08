@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
-from process_pipeline import RootPipeline, LangSplatRelevancyPipeline
+from root_pipeline import RootPipeline, LangSplatRelevancyPipeline
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -27,6 +27,7 @@ if __name__ == "__main__":
                         type=int,
                         default=[16, 32, 64, 128, 256, 256, 512],
                         )
+    parser.add_argument("--scaling_modifier", type=float, default=1.0)
     args = get_combined_args(parser)
 
     # device
@@ -42,7 +43,7 @@ if __name__ == "__main__":
     # load pipelines
     root_pipeline = RootPipeline(
         dataset_params=dataset, auto_encoder_weights=ae_weights,
-        device=device,
+        pipeline_params=pipeline_params, device=device,
         args=args
     ).to(device)
     relevancy_pipeline = LangSplatRelevancyPipeline(

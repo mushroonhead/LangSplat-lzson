@@ -35,24 +35,19 @@ class RootPipeline(torch.nn.Module):
     """
     def __init__(self, 
                  dataset_params: GroupParams, auto_encoder_weights: dict,
+                 pipeline_params: PipelineParams,
                  device: torch.device,
                  args: Namespace) -> None:
         super().__init__()
+        self.device = device
         # init gaussian and attached scene details
         self.gaussian = GaussianModel(dataset_params.sh_degree)
         self.scene = Scene(dataset_params, self.gaussian, shuffle=False)
         (model_params, first_iter) = torch.load(os.path.join(args.model_path, 'chkpnt30000.pth'))
         self.gaussian.restore(model_params, args, mode='test')
-        # set default camera properties (assume first of train set for now)
-        try:
-            cam = self.scene.getTrainCameras()[0]
-        except:
-            cam = self.scene.getTestCameras()[0]
-        self.tanfovx = math.tan(cam.FoVx * 0.5)
-        self.tanfovy = math.tan(cam.FoVy * 0.5)
-        self.proj_mat = getProjectionMatrix(znear=0.01, zfar=100., fovX=cam.FoVx, fovY=cam.FoVy).transpose(0,1).to(device=device)
-        self.image_height = cam.image_height
-        self.image_width = cam.image_width
+        # set up rasterizer (for now extract from first of train or test set and assume all the same)
+        self.setup_gaussian_rasterizer(dataset_params.white_background, args.scaling_modifier, 
+                                       pipeline_params.debug)
         # gaussian background color
         self.background = torch.tensor(([1,1,1] if dataset_params.white_background else [0, 0, 0]), 
                                        dtype=torch.float32, device="cuda")
@@ -63,16 +58,50 @@ class RootPipeline(torch.nn.Module):
         # CLIP encoder
         self.clip_encoder = OpenClipBarebones(device).to(device)
 
+    def setup_gaussian_rasterizer(self, white_background: bool, scaling_modifier: float, 
+                                  debug: bool):
+        # gaussian background color
+        background = torch.tensor(([1,1,1] if white_background else [0, 0, 0]), 
+                                  dtype=torch.float32, device="cuda")
+        # for now extract cam settings from first of train or test set and assume all the same (other than R and t)
+        try:
+            cam = self.scene.getTrainCameras()[0]
+        except:
+            cam = self.scene.getTestCameras()[0]
+        tanfovx = math.tan(cam.FoVx * 0.5)
+        tanfovy = math.tan(cam.FoVy * 0.5)
+        proj_mat = getProjectionMatrix(znear=0.01, zfar=100., fovX=cam.FoVx, fovY=cam.FoVy).transpose(0,1).to(device=self.device)
+        view_mat, cam_center = getWorld2View2(torch.eye(3, device=self.device), torch.zeros(3, device=self.device))
+        view_mat = view_mat.transpose(-1,-2)
+        self.cam_center = cam_center
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(cam.image_height),
+            image_width=int(cam.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=background,
+            scale_modifier=scaling_modifier,
+            viewmatrix=view_mat,
+            projmatrix=proj_mat,
+            sh_degree=self.gaussian.active_sh_degree,
+            campos=cam_center,
+            prefiltered=False,
+            debug=debug,
+            include_feature=True,
+        )
+        # init rasterizer
+        self.rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
     def forward(self, R: torch.Tensor, t: torch.Tensor,
                 pipeline_params: PipelineParams,
-                scaling_modifier=1., override_color = None):
+                override_color = None):
         return self.render_gaussian(R, t, pipeline_params, 
-                                    scaling_modifier=scaling_modifier, override_color=override_color)
+                                    override_color=override_color)
 
 
     def render_gaussian(self, R: torch.Tensor, t: torch.Tensor,
                         pipeline_params: PipelineParams,
-                        scaling_modifier=1., override_color = None):
+                        override_color = None):
         """
         Original render function does not propagate gradients for R and t
         Hence we instead render a view from R=I, t=(0,0,0) and rotate gaussians such that
@@ -80,39 +109,24 @@ class RootPipeline(torch.nn.Module):
         """
         # pin reference
         gaussian = self.gaussian
+        cam_center = self.cam_center
 
-        # calculate view mat and cam center
-        view_mat, cam_center = getWorld2View2(torch.eye(3, device=R.device)[None,...], torch.zeros_like(t))
-        view_mat = view_mat.transpose(-1,-2)
+        # adjust shape
+        batch_shape = R.shape[:-2]
+        R = R.view(-1,3,3)
+        t = t.view(-1,3)
 
         all_rendered_image = []
         all_language_feature_image = []
         all_radii = []
         all_screenspace_points = []
 
-        for i, (view_mat_i, cam_center_i) in enumerate(zip(view_mat, cam_center)): # only 1 rendering pipeline each time
-            # generate raster settings
-            raster_settings = GaussianRasterizationSettings(
-                image_height=int(self.image_height),
-                image_width=int(self.image_width),
-                tanfovx=self.tanfovx,
-                tanfovy=self.tanfovy,
-                bg=self.background,
-                scale_modifier=scaling_modifier,
-                viewmatrix=view_mat_i,
-                projmatrix=self.proj_mat,
-                sh_degree=gaussian.active_sh_degree,
-                campos=cam_center_i,
-                prefiltered=False,
-                debug=pipeline_params.debug,
-                include_feature=True,
-            )
-            # init rasterizer
-            rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+        for Ri, ti in zip(R, t): # only 1 rendering pipeline each time
+            # calulate inv cam to world
+            inv_R = Ri.transpose(-1,-2)
+            inv_trans = -inv_R @ ti
 
             # process storage for data types
-            inv_R = R[i,...].transpose(-1,-2)
-            inv_trans = -inv_R @ t[i,...]
             means3D = (inv_R @ gaussian.get_xyz[...,None]).squeeze(-1) + inv_trans
             screenspace_points = torch.zeros_like(means3D, dtype=means3D.dtype, 
                                                   requires_grad=True, device="cuda") + 0
@@ -142,7 +156,7 @@ class RootPipeline(torch.nn.Module):
             if override_color is None:
                 if pipeline_params.convert_SHs_python:
                     shs_view = gaussian.get_features.transpose(1, 2).view(-1, 3, (gaussian.max_sh_degree+1)**2)
-                    dir_pp = (gaussian.get_xyz - cam_center_i.repeat(gaussian.get_features.shape[0], 1))
+                    dir_pp = (gaussian.get_xyz - cam_center.repeat(gaussian.get_features.shape[0], 1))
                     dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
                     sh2rgb = eval_sh(gaussian.active_sh_degree, shs_view, dir_pp_normalized)
                     colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
@@ -156,7 +170,7 @@ class RootPipeline(torch.nn.Module):
             language_feature_precomp = language_feature_precomp/ (language_feature_precomp.norm(dim=-1, keepdim=True) + 1e-9)
                 
             # Rasterize visible Gaussians to image, obtain their radii (on screen).
-            rendered_image, language_feature_image, radii = rasterizer(
+            rendered_image, language_feature_image, radii = self.rasterizer(
                 means3D = means3D.float(),
                 means2D = means2D.float(),
                 shs = shs.float(),
@@ -172,10 +186,17 @@ class RootPipeline(torch.nn.Module):
             all_radii.append(radii)
             all_screenspace_points.append(screenspace_points)
 
-        return (torch.stack(all_rendered_image).permute(0,2,3,1), 
-                torch.stack(all_language_feature_image).permute(0,2,3,1), 
-                torch.stack(all_radii),
-                torch.stack(all_screenspace_points))
+        # stack
+        img = torch.stack(all_rendered_image).permute(0,2,3,1)
+        lang_feat = torch.stack(all_language_feature_image).permute(0,2,3,1)
+        radii = torch.stack(all_radii)
+        screen_space_pts = torch.stack(all_screenspace_points)
+        
+        # shape 1st dim back
+        return (img.view(*batch_shape, *img.shape[-3:]),
+                lang_feat.view(*batch_shape, *lang_feat.shape[-3:]),
+                radii.view(*batch_shape, -1),
+                screen_space_pts.view(*batch_shape, *screen_space_pts.shape[-2:]))
     
 
 class LangSplatRelevancyPipeline(torch.nn.Module):
@@ -200,14 +221,14 @@ class LangSplatRelevancyPipeline(torch.nn.Module):
 
     def forward(self, query: str, R: torch.Tensor, t: torch.Tensor,
                 pipeline_params: PipelineParams,
-                scaling_modifier=1., override_color = None,
+                override_color = None,
                 decode_batchsize=1):
         # set query
         self.set_positives([query])
         # render gaussian and keep features only
         _, encoded_lang_feat, _, _ = self.root_pipeline(R, t,
                                                         pipeline_params=pipeline_params,
-                                                        scaling_modifier=scaling_modifier, override_color=override_color)
+                                                        override_color=override_color)
         # split processing of dataset to prevent out of memory
         all_valid_map = []
         full_batch_size = encoded_lang_feat.shape[0]
@@ -221,7 +242,6 @@ class LangSplatRelevancyPipeline(torch.nn.Module):
         # return valid map
         return torch.cat(all_valid_map, dim=0)
     
-    @torch.no_grad()
     def get_relevancy(self, embed: torch.Tensor, positive_id: int) -> torch.Tensor:
         # embed: 32768x512
         phrases_embeds = torch.cat([self.pos_embeds, self.neg_embeds], dim=0)
