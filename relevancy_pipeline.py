@@ -10,7 +10,20 @@ from eval.openclip_encoder import OpenCLIPNetwork
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from utils.graphics_utils import getProjectionMatrix
 from utils.sh_utils import eval_sh
-from utils.spatial_tensor_utils import getWorld2View2
+from utils.spatial_tensor_utils import rot2quat, quat2rot, quat_mult, getWorld2View2
+
+
+def scaleRot2covar(rot: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """
+    Converts rot and scale to 3D covar using RSS^tR^t
+    - Inputs:
+        - rot: (B,4) tensor, rot in quaternions rxyz
+        - scale: (B,3) tensor, scale for xyz
+    """
+    scale = scale.diag() # make diag to ensure the eig vals are +ve
+    rot = quat2rot(rot)
+
+    return rot @ scale @ scale.transpose(-1,-2) @ rot.transpose(-1,-2)
 
 
 class ImageRelevancyPipeline(torch.nn.Module):
@@ -25,6 +38,7 @@ class ImageRelevancyPipeline(torch.nn.Module):
         self.gaussian = GaussianModel(dataset_params.sh_degree)
         self.scene = Scene(dataset_params, self.gaussian, shuffle=False)
         (model_params, first_iter) = torch.load(os.path.join(args.model_path, 'chkpnt30000.pth'))
+        self.gaussian.restore(model_params, args, mode='test')
         # set default camera properties (assume first of train set for now)
         try:
             cam = self.scene.getTrainCameras()[0]
@@ -36,12 +50,12 @@ class ImageRelevancyPipeline(torch.nn.Module):
         self.image_height = cam.image_height
         self.image_width = cam.image_width
         # gaussian background color
-        self.gaussian.restore(model_params, args, mode='test')
         self.background = torch.tensor(([1,1,1] if dataset_params.white_background else [0, 0, 0]), 
                                        dtype=torch.float32, device="cuda")
         # autoencoder to decode
         self.autoencoder = Autoencoder(args.encoder_dims, args.decoder_dims).to(device)
         self.autoencoder.load_state_dict(auto_encoder_weights)
+        self.autoencoder.eval()
         # CLIP encoder
         self.clip_model = OpenCLIPNetwork(device)
 
@@ -72,11 +86,16 @@ class ImageRelevancyPipeline(torch.nn.Module):
     def render_gaussian(self, R: torch.Tensor, t: torch.Tensor,
                         pipeline_params: PipelineParams,
                         scaling_modifier=1., override_color = None):
+        """
+        Original render function does not propagate gradients for R and t
+        Hence we instead render a view from R=I, t=(0,0,0) and rotate gaussians such that
+        new_rot = invR @ old_rot, new_3dmean = invR @ old_mean - invR @ t 
+        """
         # pin reference
         gaussian = self.gaussian
 
         # calculate view mat and cam center
-        view_mat, cam_center = getWorld2View2(R, t)
+        view_mat, cam_center = getWorld2View2(torch.eye(3, device=R.device)[None,...], torch.zeros_like(t))
         view_mat = view_mat.transpose(-1,-2)
 
         all_rendered_image = []
@@ -84,7 +103,7 @@ class ImageRelevancyPipeline(torch.nn.Module):
         all_radii = []
         all_screenspace_points = []
 
-        for view_mat_i, cam_center_i in zip(view_mat, cam_center): # only 1 rendering pipeline each time
+        for i, (view_mat_i, cam_center_i) in enumerate(zip(view_mat, cam_center)): # only 1 rendering pipeline each time
             # generate raster settings
             raster_settings = GaussianRasterizationSettings(
                 image_height=int(self.image_height),
@@ -105,26 +124,29 @@ class ImageRelevancyPipeline(torch.nn.Module):
             rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
             # process storage for data types
-            screenspace_points = torch.zeros_like(gaussian.get_xyz, dtype=gaussian.get_xyz.dtype, 
+            inv_R = R[i,...].transpose(-1,-2)
+            inv_trans = -inv_R @ t[i,...]
+            means3D = (inv_R @ gaussian.get_xyz[...,None]).squeeze(-1) + inv_trans
+            screenspace_points = torch.zeros_like(means3D, dtype=means3D.dtype, 
                                                   requires_grad=True, device="cuda") + 0
             try:
                 screenspace_points.retain_grad()
             except:
                 pass
-            means3D = self.gaussian.get_xyz
             means2D = screenspace_points
             opacity = self.gaussian.get_opacity
 
             # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
             # scaling / rotation by the rasterizer.
+            inv_R_quat = rot2quat(inv_R)
             scales = None
             rotations = None
             cov3D_precomp = None
             if pipeline_params.compute_cov3D_python:
-                cov3D_precomp = gaussian.get_covariance(scaling_modifier)
+                rotations = scaleRot2covar(quat_mult(gaussian.get_rotation, inv_R_quat), gaussian.get_scaling)
             else:
                 scales = gaussian.get_scaling
-                rotations = gaussian.get_rotation
+                rotations = quat_mult(gaussian.get_rotation, inv_R_quat)
 
             # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
             # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
