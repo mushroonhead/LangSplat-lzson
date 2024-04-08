@@ -10,7 +10,7 @@ from eval.openclip_encoder import OpenCLIPNetwork
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from utils.graphics_utils import getProjectionMatrix
 from utils.sh_utils import eval_sh
-from utils.spatial_tensor_utils import rot2quat, quat2rot, quat_mult, getWorld2View2
+from utils.spatial_tensor_utils import rot2quat, quat2rot, quat_mult, transform_inv, getWorld2View2
 from open_clip_bare.open_clip_bare import OpenClipBarebones
 
 
@@ -123,11 +123,10 @@ class RootPipeline(torch.nn.Module):
 
         for Ri, ti in zip(R, t): # only 1 rendering pipeline each time
             # calulate inv cam to world
-            inv_R = Ri.transpose(-1,-2)
-            inv_trans = -inv_R @ ti
+            Ri_inv, ti_inv = transform_inv(Ri, ti)
 
             # process storage for data types
-            means3D = (inv_R @ gaussian.get_xyz[...,None]).squeeze(-1) + inv_trans
+            means3D = (Ri_inv @ gaussian.get_xyz[...,None]).squeeze(-1) + ti_inv
             screenspace_points = torch.zeros_like(means3D, dtype=means3D.dtype, 
                                                   requires_grad=True, device="cuda") + 0
             try:
@@ -139,7 +138,7 @@ class RootPipeline(torch.nn.Module):
 
             # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
             # scaling / rotation by the rasterizer.
-            inv_R_quat = rot2quat(inv_R)
+            inv_R_quat = rot2quat(Ri_inv)
             scales = None
             rotations = None
             cov3D_precomp = None

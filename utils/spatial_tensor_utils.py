@@ -142,6 +142,20 @@ def rand_rot_quat(size: Tuple[int,Iterable[int]],
     """
     return torch.nn.functional.normalize(torch.randn(size, 4, dtype=dtype, device=device))
 
+def transform_inv(R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """
+    Does an inverse transformation for R t transformation
+    - Inputs:
+        - R : (...,3,3) tensor, rotation matrix
+        - t: (...,3) tensor, translation vector
+    - Returns:
+        - R_inv: (...,3,3) tensor, rotation matrix
+        - t_inv: (...,3) tensor, translation vector
+    """
+    R_inv = R.transpose(-1,-2)
+    t_inv = (-R_inv @ t[...,None]).squeeze(-1)
+    return R_inv, t_inv
+
 def getWorld2View2(R : torch.Tensor, t: torch.Tensor, 
                    translate=torch.zeros(3), scale=1.0) -> torch.Tensor:
     """
