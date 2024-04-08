@@ -49,10 +49,12 @@ if __name__ == "__main__":
     queries = ['pikachu','gundam'] #N queries
 
     # render with no grad
-    with torch.no_grad():
-        cam = pipeline.scene.getTrainCameras()[0] # temporary get 1
-        R = torch.as_tensor(cam.R[None,...], device=device, dtype=torch.float32)
-        t = torch.as_tensor(cam.T[None,...], device=device, dtype=torch.float32)
-        valid_map = pipeline(queries[0], R, t, pipeline_params)
-        plt.imshow(valid_map[0,...].squeeze(0).detach().cpu().numpy())
-        pass
+    cam = pipeline.scene.getTrainCameras()[0] # temporary get 1
+    R = torch.tensor(cam.R[None,...], device=device, dtype=torch.float32, requires_grad=True)
+    t = torch.tensor(cam.T[None,...], device=device, dtype=torch.float32, requires_grad=True)
+    valid_map = pipeline(queries[0], R, t, pipeline_params)
+    plt.imshow(valid_map[0,...].squeeze(0).detach().cpu().numpy())
+    valid_map.max().backward() # temp test
+    print('R grad:', R.grad)
+    print('t grad:', t.grad)
+    pass

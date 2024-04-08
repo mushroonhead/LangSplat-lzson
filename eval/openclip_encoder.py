@@ -38,7 +38,7 @@ class OpenCLIPNetwork:
         self.pos_embeds /= self.pos_embeds.norm(dim=-1, keepdim=True)
         self.neg_embeds /= self.neg_embeds.norm(dim=-1, keepdim=True)
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def get_relevancy(self, embed: torch.Tensor, positive_id: int) -> torch.Tensor:
         # embed: 32768x512
         phrases_embeds = torch.cat([self.pos_embeds, self.neg_embeds], dim=0)
