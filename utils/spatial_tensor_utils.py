@@ -27,13 +27,16 @@ def quat2rot(quat: torch.Tensor) -> torch.Tensor:
 
 def rot2quat(rot: torch.Tensor) -> torch.Tensor:
     """
-    Vectorized for 1 dim only (code requirements complex)
     From: https://danceswithcode.net/engineeringnotes/quaternions/quaternions.html
     - Inputs:
-        - rot: (B,3,3) tensor
+        - rot: (...,3,3) tensor
     - Returns:
-        - quat: (B,4) tensor, rxyz
+        - quat: (...,4) tensor, rxyz
     """
+    # reshape to (B,3,3)
+    batch_shape = rot.shape[:-2]
+    rot = rot.view(-1,3,3)
+
     # find magnitude first
     mag = torch.stack(
         (1 + rot[:,0,0] + rot[:,1,1] + rot[:,2,2],
@@ -81,9 +84,10 @@ def rot2quat(rot: torch.Tensor) -> torch.Tensor:
          m3[:,3]), dim=-1)
     
     # shape rotations back to correct space
-    quat = h0 @ c0_quats + h1 @ c1_quats + h2 @ c2_quats + h3 @ c3_quats
-
-    return quat.to_dense()
+    quat = (h0 @ c0_quats + h1 @ c1_quats + h2 @ c2_quats + h3 @ c3_quats).to_dense()
+    
+    # reshape to original shape
+    return quat.view(*batch_shape, 4)
 
 def quat_mult(q0: torch.Tensor, q1: torch.Tensor) -> torch.Tensor:
     """
