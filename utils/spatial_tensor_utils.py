@@ -5,7 +5,7 @@ Spatial manipulation utils implemented with vectorized tensor operations
 import torch
 from typing import Iterable, Tuple
 
-def quat2rot(quat: torch.Tensor) -> torch.Tensor:
+def quat_2_rot(quat: torch.Tensor) -> torch.Tensor:
     """
     From: https://danceswithcode.net/engineeringnotes/quaternions/quaternions.html
     - Inputs:
@@ -25,7 +25,7 @@ def quat2rot(quat: torch.Tensor) -> torch.Tensor:
                       1 - 2*(quat[...,1]*quat[...,1] + quat[...,2]*quat[...,2])), dim=-1)), dim=-2)
     return rot
 
-def rot2quat(rot: torch.Tensor) -> torch.Tensor:
+def rot_2_quat(rot: torch.Tensor) -> torch.Tensor:
     """
     From: https://danceswithcode.net/engineeringnotes/quaternions/quaternions.html
     - Inputs:
@@ -140,7 +140,62 @@ def rand_rot_quat(size: Tuple[int,Iterable[int]],
     - Returns:
         - rand_quat: (size,4) tensor, rxyz
     """
-    return torch.nn.functional.normalize(torch.randn(size, 4, dtype=dtype, device=device))
+    rand_quat = torch.randn(*size, 4, dtype=dtype, device=device) \
+        if size is Iterable else torch.randn(size, 4, dtype=dtype, device=device)
+    return torch.nn.functional.normalize(rand_quat)
+
+def dir_2_skew(dir: torch.Tensor) -> torch.Tensor:
+    """
+    Generates a skew matrix from the direction vector
+    - Inputs:
+        - dir: (...,3) tensor, xyz
+    - Returns:
+        - skew: (...,3,3) tensor
+    """
+    batch_shape = dir.shape[:-1]
+    dtype, device = dir.dtype, dir.device
+    
+    skew = torch.stack(
+        (torch.stack(
+            (torch.zeros(*batch_shape, dtype=dtype, device=device), -dir[...,2], dir[...,1]), dim=-1),
+         torch.stack(
+            (dir[...,2], torch.zeros(*batch_shape, dtype=dtype, device=device), -dir[...,0]), dim=-1),
+         torch.stack(
+            (-dir[...,1], dir[...,0], torch.zeros(*batch_shape, dtype=dtype, device=device)), dim=-1)),
+        dim =-1)
+    return skew
+
+def axis_angle_2_rot(axis_dir: torch.Tensor, axis_ang: torch.Tensor) -> torch.Tensor:
+    """
+    https://www.euclideanspace.com/maths/geometry/rotations/conversions/angleToMatrix/index.htm
+    - Inputs:
+        - axis_dir: (...,3) tensor, xyz
+        - axis_ang: (...,) tensor, theta
+    - Returns:
+        - rot: (...,3,3) tensor
+    """
+    K = dir_2_skew(axis_dir)
+    rot = torch.eye(3, device=axis_ang.device, dtype=axis_ang.dtype) + \
+        axis_ang.sin()[...,None,None] * K + (1 - axis_ang.cos())[...,None,None] * K @ K
+    return rot
+
+def rand_axis_ang(size: Tuple[int,Iterable[int]], 
+                  dtype=torch.float32, device=torch.device('cpu')) -> torch.Tensor:
+    """
+    Random axis angle rotations
+    - Inputs:
+        - size: int | iterable of int, number of rand rotational quaternions to use
+        - dtype: torch.dtype, dtype of generated tensor
+        - device: torch.device, device of generated tensor  
+    - Returns:
+        - rand_axis_dir: (size,3) tensor, xyz
+        - rand_axis_ang: (size,) tensor, ang rads
+    """
+    if size is not Iterable:
+        size = (size,) 
+    rand_axis_dir = torch.nn.functional.normalize(torch.randn(*size, 3, dtype=dtype, device=device))
+    rand_axis_ang = 2*torch.pi*torch.rand(*size) - torch.pi
+    return rand_axis_dir, rand_axis_ang
 
 def transform_inv(R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     """
@@ -183,6 +238,26 @@ def getWorld2View2(R : torch.Tensor, t: torch.Tensor,
     Rt = torch.linalg.solve(C2W, torch.eye(4, device=R.device, dtype=torch.float64))
     return Rt.to(dtype=R.dtype), C2W[...,3,:3].to(dtype=R.dtype) # back to original precision
 
+def rot_cam_look_at(cam_pose: torch.Tensor, target_pose: torch.Tensor) -> torch.Tensor:
+    """
+    Rotation matrix to turn the cam to look at target (assuming cam is facing +z axis)
+    - Inputs:
+        - cam_pose: (...,3) tensor, xyz
+        - target_pose: (...,3) tensor, xyz
+    - Returns:
+        - rot_2_look: (...,3,3) tensor
+    """
+    batch_shape = cam_pose.shape[:-1]
+    delta_pose = target_pose - cam_pose
+    axis_dir = torch.nn.functional.normalize(
+        torch.linalg.cross(
+            torch.tensor([0,0,1], dtype=cam_pose.dtype, device=cam_pose.device).expand(*batch_shape, -1),
+            torch.nn.functional.normalize(delta_pose, dim=-1), dim=-1),
+        dim = -1)
+    axis_ang = torch.linalg.norm(delta_pose[...,:2], dim =-1).atan2(delta_pose[...,-1])
+
+    return axis_angle_2_rot(axis_dir, axis_ang)
+
 
 if __name__ == '__main__':
     """
@@ -200,18 +275,44 @@ if __name__ == '__main__':
         f'Inversion does not give unit rotation, output: {quat_mult(rand_quats_inv, rand_quats)}'
     
     # check quat2rot using inversion
-    rand_rots = quat2rot(rand_quats)
-    rand_rots_inv = quat2rot(rand_quats_inv)
+    rand_rots = quat_2_rot(rand_quats)
+    rand_rots_inv = quat_2_rot(rand_quats_inv)
     assert torch.allclose(torch.eye(3, dtype=torch.float64), rand_rots @ rand_rots_inv), \
         f'Inversion does not give unit rotation, output: {rand_rots @ rand_rots_inv}'
     assert torch.allclose(torch.eye(3, dtype=torch.float64), rand_rots_inv @ rand_rots), \
         f'Inversion does not give unit rotation, output: {rand_rots_inv @ rand_rots}'
     
     # check rot2quat using inversion
-    rand_rots_2 = rot2quat(rand_rots)
-    rand_rots_inv_2 = rot2quat(rand_rots_inv)
+    rand_rots_2 = rot_2_quat(rand_rots)
+    rand_rots_inv_2 = rot_2_quat(rand_rots_inv)
     # check includes an abs due to 2 possible quat -> quaternion and its negative
     assert torch.allclose(unit_quat(dtype=torch.float64), quat_mult(rand_rots_2, rand_rots_inv_2).abs()), \
         f'Inversion does not give unit rotation, output: {quat_mult(rand_rots_2, rand_rots_inv_2).abs()}'
     assert torch.allclose(unit_quat(dtype=torch.float64), quat_mult(rand_rots_inv_2, rand_rots_2).abs()), \
         f'Inversion does not give unit rotation, output: {quat_mult(rand_rots_inv_2, rand_rots_2).abs()}'
+    
+    # check axis angle rotation using inversion
+    rand_dir, rand_ang = rand_axis_ang(6, dtype=torch.float64)
+    forward_rot = axis_angle_2_rot(rand_dir, rand_ang)
+    backward_rot = axis_angle_2_rot(rand_dir, -rand_ang)
+    # check inversion operation (alot less precise than other operations)
+    assert torch.allclose(torch.eye(3, dtype=torch.float64), forward_rot @ backward_rot, atol=1e-7), \
+        f'Inversion does not give unit rotation, output: {forward_rot @ backward_rot}'
+    assert torch.allclose(torch.eye(3, dtype=torch.float64), backward_rot @ forward_rot, atol=1e-7), \
+        f'Inversion does not give unit rotation, output: {backward_rot @ forward_rot}'
+    
+    backward_rot2 = axis_angle_2_rot(-rand_dir, rand_ang)
+    # check inversion operation (alot less precise than other operations)
+    assert torch.allclose(torch.eye(3, dtype=torch.float64), forward_rot @ backward_rot2, atol=1e-7), \
+        f'Inversion does not give unit rotation, output: {forward_rot @ backward_rot2}'
+    assert torch.allclose(torch.eye(3, dtype=torch.float64), backward_rot2 @ forward_rot, atol=1e-7), \
+        f'Inversion does not give unit rotation, output: {backward_rot2 @ forward_rot}'
+    
+    # check camera look at by doing a global and local transform
+    center = torch.zeros(6, 3, dtype=torch.float64)
+    projected = center + torch.nn.functional.normalize(torch.randn(6, 3, dtype=torch.float64))
+    rot_2_look = rot_cam_look_at(center, projected)
+    _, t_2 = transform_inv(rot_2_look, torch.tensor([0,0,-1], dtype=torch.float64))
+    # check if locally project, both will be same location
+    assert torch.allclose(projected, t_2), f'Projected positions not same, correct: {projected}, tested: {t_2}'
+    pass

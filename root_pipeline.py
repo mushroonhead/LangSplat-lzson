@@ -10,7 +10,7 @@ from eval.openclip_encoder import OpenCLIPNetwork
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from utils.graphics_utils import getProjectionMatrix
 from utils.sh_utils import eval_sh
-from utils.spatial_tensor_utils import rot2quat, quat2rot, quat_mult, transform_inv, getWorld2View2
+from utils.spatial_tensor_utils import rot_2_quat, quat_2_rot, quat_mult, transform_inv, getWorld2View2
 from open_clip_bare.open_clip_bare import OpenClipBarebones
 
 
@@ -22,7 +22,7 @@ def scaleRot2covar(rot: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         - scale: (B,3) tensor, scale for xyz
     """
     scale = scale.diag() # make diag to ensure the eig vals are +ve
-    rot = quat2rot(rot)
+    rot = quat_2_rot(rot)
 
     return rot @ scale @ scale.transpose(-1,-2) @ rot.transpose(-1,-2)
 
@@ -138,7 +138,7 @@ class RootPipeline(torch.nn.Module):
 
             # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
             # scaling / rotation by the rasterizer.
-            inv_R_quat = rot2quat(Ri_inv)
+            inv_R_quat = rot_2_quat(Ri_inv)
             scales = None
             rotations = None
             cov3D_precomp = None
