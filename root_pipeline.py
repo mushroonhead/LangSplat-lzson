@@ -2,11 +2,11 @@ import torch
 from scene import Scene
 import os
 import math
+from typing import Optional
 
 from arguments import PipelineParams, GroupParams, Namespace
 from gaussian_renderer import GaussianModel
 from autoencoder.model import Autoencoder
-from eval.openclip_encoder import OpenCLIPNetwork
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from utils.graphics_utils import getProjectionMatrix
 from utils.sh_utils import eval_sh
@@ -21,7 +21,7 @@ def scaleRot2covar(rot: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         - rot: (B,4) tensor, rot in quaternions rxyz
         - scale: (B,3) tensor, scale for xyz
     """
-    scale = scale.diag() # make diag to ensure the eig vals are +ve
+    scale = scale.diag_embed() # make diag to ensure the eig vals are +ve
     rot = quat_2_rot(rot)
 
     return rot @ scale @ scale.transpose(-1,-2) @ rot.transpose(-1,-2)
@@ -94,13 +94,16 @@ class RootPipeline(torch.nn.Module):
 
     def forward(self, R: torch.Tensor, t: torch.Tensor,
                 pipeline_params: PipelineParams,
+                opa_scaling: Optional[torch.Tensor] = None,
                 override_color = None):
         return self.render_gaussian(R, t, pipeline_params, 
+                                    opa_scaling,
                                     override_color=override_color)
 
 
     def render_gaussian(self, R: torch.Tensor, t: torch.Tensor,
                         pipeline_params: PipelineParams,
+                        opa_scaling: Optional[torch.Tensor] = None,
                         override_color = None):
         """
         Original render function does not propagate gradients for R and t
@@ -134,7 +137,8 @@ class RootPipeline(torch.nn.Module):
             except:
                 pass
             means2D = screenspace_points
-            opacity = self.gaussian.get_opacity
+            opacity = self.gaussian.get_opacity if opa_scaling is None \
+                else self.gaussian.get_opacity * opa_scaling
 
             # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
             # scaling / rotation by the rasterizer.

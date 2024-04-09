@@ -144,6 +144,20 @@ def rand_rot_quat(size: Tuple[int,Iterable[int]],
         if size is Iterable else torch.randn(size, 4, dtype=dtype, device=device)
     return torch.nn.functional.normalize(rand_quat)
 
+def rand_rot(size: Tuple[int,Iterable[int]], 
+             dtype=torch.float32, device=torch.device('cpu')) -> torch.Tensor:
+    """
+    Random rotation matrix
+    - Inputs:
+        - size: int | iterable of int, number of rand rotational quaternions to use
+        - dtype: torch.dtype, dtype of generated tensor
+        - device: torch.device, device of generated tensor  
+    - Returns:
+        - rand_quat: (size,3,3) tensor, 
+    """
+    return quat_2_rot(rand_rot_quat(size, dtype=dtype, device=device))
+
+
 def dir_2_skew(dir: torch.Tensor) -> torch.Tensor:
     """
     Generates a skew matrix from the direction vector
@@ -238,20 +252,20 @@ def getWorld2View2(R : torch.Tensor, t: torch.Tensor,
     Rt = torch.linalg.solve(C2W, torch.eye(4, device=R.device, dtype=torch.float64))
     return Rt.to(dtype=R.dtype), C2W[...,3,:3].to(dtype=R.dtype) # back to original precision
 
-def rot_cam_look_at(cam_pose: torch.Tensor, target_pose: torch.Tensor) -> torch.Tensor:
+def rot_cam_look_at(target_pose: torch.Tensor, cam_pose: torch.Tensor) -> torch.Tensor:
     """
     Rotation matrix to turn the cam to look at target (assuming cam is facing +z axis)
     - Inputs:
-        - cam_pose: (...,3) tensor, xyz
         - target_pose: (...,3) tensor, xyz
+        - cam_pose: (...,3) tensor, xyz
     - Returns:
         - rot_2_look: (...,3,3) tensor
     """
-    batch_shape = cam_pose.shape[:-1]
-    delta_pose = target_pose - cam_pose
+    batch_shape = target_pose.shape[:-1]
+    delta_pose = cam_pose - target_pose
     axis_dir = torch.nn.functional.normalize(
         torch.linalg.cross(
-            torch.tensor([0,0,1], dtype=cam_pose.dtype, device=cam_pose.device).expand(*batch_shape, -1),
+            torch.tensor([0,0,1], dtype=target_pose.dtype, device=target_pose.device).expand(*batch_shape, -1),
             torch.nn.functional.normalize(delta_pose, dim=-1), dim=-1),
         dim = -1)
     axis_ang = torch.linalg.norm(delta_pose[...,:2], dim =-1).atan2(delta_pose[...,-1])
@@ -309,10 +323,10 @@ if __name__ == '__main__':
         f'Inversion does not give unit rotation, output: {backward_rot2 @ forward_rot}'
     
     # check camera look at by doing a global and local transform
-    center = torch.zeros(6, 3, dtype=torch.float64)
+    center = torch.randn(6, 3, dtype=torch.float64)
     projected = center + torch.nn.functional.normalize(torch.randn(6, 3, dtype=torch.float64))
     rot_2_look = rot_cam_look_at(center, projected)
-    _, t_2 = transform_inv(rot_2_look, torch.tensor([0,0,-1], dtype=torch.float64))
+    R_2, t_2 = transform_inv(rot_2_look, torch.tensor([0,0,-1], dtype=torch.float64))
     # check if locally project, both will be same location
-    assert torch.allclose(projected, t_2), f'Projected positions not same, correct: {projected}, tested: {t_2}'
+    assert torch.allclose(projected, t_2 + center), f'Projected positions not same, correct: {projected}, tested: {t_2 + center}'
     pass
