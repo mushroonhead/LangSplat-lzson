@@ -108,23 +108,45 @@ class RootPipeline(torch.nn.Module):
         """
         Original render function does not propagate gradients for R and t
         Hence we instead render a view from R=I, t=(0,0,0) and rotate gaussians such that
-        new_rot = invR @ old_rot, new_3dmean = invR @ old_mean - invR @ t 
+        new_rot = invR @ old_rot, new_3dmean = invR @ old_mean - invR @ t
+        - Inputs:
+            - R: (V..,3,3)
+            - t: (V..,3)
+            - opa_scaling: (B..,N,1)
+        - Returns:
+            - rendered_image: (V..,B..,H,W,3)
+            - language_feature_image: (V..,B..,H,W,3)
+            - radii: (V..,B..,1)
+            - screenspace_points
         """
         # pin reference
         gaussian = self.gaussian
         cam_center = self.cam_center
 
         # adjust shape
-        batch_shape = R.shape[:-2]
-        R = R.view(-1,3,3)
-        t = t.view(-1,3)
+        view_shape = R.shape[:-2]
+        R = R.view(-1,3,3) # (Vf,3,3)
+        t = t.view(-1,3) # (Vf,3)
+        vf_shape = R.shape[0]
+
+        if opa_scaling is None:
+            opa_scaling = torch.ones_like(gaussian.get_xyz[:,-1])[...,None]
+
+        batch_opa_shape = opa_scaling.shape[:-2]
+        N = opa_scaling.shape[-2]
+        opa_scaling = opa_scaling.view(-1,N,1) # (Nf,3,3)
+        nf_shape = opa_scaling.shape[0]
+
+        R = R[...,None,:,:].expand(vf_shape,nf_shape,-1,-1).view(-1,3,3) # (Vf*Nf,3,3)
+        t = t[...,None,:].expand(vf_shape,nf_shape,-1).view(-1,3) # (Vf*Nf,3)
+        opa_scaling = opa_scaling[None,...].expand(vf_shape,nf_shape,-1,-1).view(-1,N,1) # (Vf*Nf,N,1)
 
         all_rendered_image = []
         all_language_feature_image = []
         all_radii = []
         all_screenspace_points = []
 
-        for Ri, ti in zip(R, t): # only 1 rendering pipeline each time
+        for Ri, ti, opi in zip(R, t, opa_scaling): # only 1 rendering pipeline each time
             # calulate inv cam to world
             Ri_inv, ti_inv = transform_inv(Ri, ti)
 
@@ -137,8 +159,7 @@ class RootPipeline(torch.nn.Module):
             except:
                 pass
             means2D = screenspace_points
-            opacity = self.gaussian.get_opacity if opa_scaling is None \
-                else self.gaussian.get_opacity * opa_scaling
+            opacity = opi
 
             # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
             # scaling / rotation by the rasterizer.
@@ -190,16 +211,16 @@ class RootPipeline(torch.nn.Module):
             all_screenspace_points.append(screenspace_points)
 
         # stack
-        img = torch.stack(all_rendered_image).permute(0,2,3,1)
-        lang_feat = torch.stack(all_language_feature_image).permute(0,2,3,1)
-        radii = torch.stack(all_radii)
-        screen_space_pts = torch.stack(all_screenspace_points)
+        img = torch.stack(all_rendered_image).permute(0,2,3,1) # (Vf*Nf,H,W,3)
+        lang_feat = torch.stack(all_language_feature_image).permute(0,2,3,1)  # (Vf*Nf,H,W,3)
+        radii = torch.stack(all_radii) # (Vf*Nf,1)
+        screen_space_pts = torch.stack(all_screenspace_points) # (Vf*Nf,3)
         
-        # shape 1st dim back
-        return (img.view(*batch_shape, *img.shape[-3:]),
-                lang_feat.view(*batch_shape, *lang_feat.shape[-3:]),
-                radii.view(*batch_shape, -1),
-                screen_space_pts.view(*batch_shape, *screen_space_pts.shape[-2:]))
+        # shape back
+        return (img.view(*view_shape, *batch_opa_shape, *img.shape[-3:]),
+                lang_feat.view(*view_shape, *batch_opa_shape, *lang_feat.shape[-3:]),
+                radii.view(*view_shape, *batch_opa_shape, -1),
+                screen_space_pts.view(*view_shape, *batch_opa_shape, *screen_space_pts.shape[-2:]))
     
 
 class LangSplatRelevancyPipeline(torch.nn.Module):

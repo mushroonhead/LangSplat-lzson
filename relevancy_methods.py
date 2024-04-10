@@ -2,10 +2,12 @@
 Methods to do relevancy calculation
 """
 
+from numbers import Real
 import torch
 import numpy as np
 from torchvision.transforms.v2 import RandomCrop
 from typing import Optional
+from torch_bp.graph.factors import UnaryFactor
 
 from arguments import PipelineParams #, GroupParams, Namespace
 from root_pipeline import RootPipeline
@@ -52,10 +54,10 @@ class TestPipeline(torch.nn.Module):
                 opa_scaling: Optional[torch.Tensor] = None,
                 override_color = None,
                 decode_batchsize=1):
-        return self.cos_similarity_comp(query, R, t, opa_scaling=opa_scaling,
-                                        pipeline_params=pipeline_params, override_color=override_color,
-                                        decode_batchsize=decode_batchsize)
-        # return self.render_random_views(5, pipeline_params, override_color)
+        # return self.cos_similarity_comp(query, R, t, opa_scaling=opa_scaling,
+        #                                 pipeline_params=pipeline_params, override_color=override_color,
+        #                                 decode_batchsize=decode_batchsize)
+        return self.render_random_views(5, pipeline_params, override_color)
     
     def cos_similarity_comp(self, query: str, R: torch.Tensor, t: torch.Tensor,
                             pipeline_params: PipelineParams,
@@ -71,7 +73,7 @@ class TestPipeline(torch.nn.Module):
                                                         pipeline_params=pipeline_params,
                                                         override_color=override_color) #(B,H,W,3)
         # patch sample to reduce memory requirements
-        encoded_lang_feat = self.patch_sample_2d(encoded_lang_feat, num_samples=5, patch_size=256)
+        encoded_lang_feat = self.patch_sample_2d(encoded_lang_feat, num_samples=9, patch_size=256)
         # decoding, allow splitting due to large memory size
         full_batch_size = encoded_lang_feat.shape[:-3]
         encoded_lang_feat = encoded_lang_feat.reshape(-1, *encoded_lang_feat.shape[-3:])
@@ -108,8 +110,8 @@ class TestPipeline(torch.nn.Module):
         self.gaussian_distrb = torch.distributions.MixtureSameFamily(mix, comp)
     
     def random_select_views(self, num_views):
-        # R, t = zip(*[(self.root_pipeline.scene.getTrainCameras()[0].R, self.root_pipeline.scene.getTrainCameras()[0].T) for _ in range(5)])
-        R, t = zip(*[(cam.R, cam.T) for cam in self.root_pipeline.scene.getTrainCameras()])
+        R, t = zip(*[(self.root_pipeline.scene.getTrainCameras()[0].R, self.root_pipeline.scene.getTrainCameras()[0].T) for _ in range(5)])
+        # R, t = zip(*[(cam.R, cam.T) for cam in self.root_pipeline.scene.getTrainCameras()])
         R = torch.tensor(np.stack(R), dtype=torch.float32, device=self.root_pipeline.device)
         t = torch.tensor(np.stack(t), dtype=torch.float32, device=self.root_pipeline.device)
         # t = (R.transpose(-1,-2) @ t[...,None]).squeeze(-1)
@@ -167,8 +169,3 @@ class TestPipeline(torch.nn.Module):
         patches = patches.permute(0,2,3,1)
 
         return patches
-
-
-# create a function that hooks onto the relevancy pipeline calls
-# generate simple unary graph for an entity at fixed camera
-# optimize for opacity scaling
