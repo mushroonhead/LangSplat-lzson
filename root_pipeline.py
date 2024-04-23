@@ -200,7 +200,7 @@ class RootPipeline(torch.nn.Module):
                 shs = shs.float(),
                 colors_precomp = colors_precomp,
                 language_feature_precomp = language_feature_precomp.float(),
-                opacities = opacity.float(),
+                opacities = gaussian.get_opacity *  opacity.float(),
                 scales = scales.float(),
                 rotations = rotations.float(),
                 cov3D_precomp = cov3D_precomp)

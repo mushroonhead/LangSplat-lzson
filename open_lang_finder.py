@@ -49,15 +49,15 @@ if __name__ == "__main__":
         pipeline_params=pipeline_params, device=device,
         args=args
     ).to(device)
-    # relevancy_pipeline = LangSplatRelevancyPipeline(
-    #     root_pipeline=root_pipeline,
-    #     device = device
+    relevancy_pipeline = LangSplatRelevancyPipeline(
+        root_pipeline=root_pipeline,
+        device = device
+    ).to(device)
+    # relevancy_pipeline = TestPipeline(
+    #     root_pipeline=root_pipeline
     # ).to(device)
-    # # relevancy_pipeline = TestPipeline(
-    # #     root_pipeline=root_pipeline
-    # # ).to(device)
 
-    # queries = ['pikachu','gundam'] #N queries
+    queries = ['pikachu','gundam'] #N queries
 
     # # render with no grad
     # cam = root_pipeline.scene.getTrainCameras()[0] # temporary get 1
@@ -65,21 +65,22 @@ if __name__ == "__main__":
     # t = torch.tensor(cam.T[None,...], device=device, dtype=torch.float32, requires_grad=True)
     # opa_scaling = torch.randn_like(root_pipeline.gaussian.get_xyz[...,-1], requires_grad=True)
     # opa_scaling_norm = torch.distributions.Normal(opa_scaling.mean(), opa_scaling.cov().clamp(min=1e-3)).cdf(opa_scaling)[...,None]
-    # valid_map = relevancy_pipeline(queries[0], R, t, #opa_scaling=opa_scaling_norm, 
+    # valid_map = relevancy_pipeline(queries[0], R, t, 
+    #                                opa_scaling=opa_scaling_norm, 
     #                                pipeline_params=pipeline_params)
-    # # plt.imshow(valid_map[0,0].detach().cpu().numpy())
-    # # plt.show()
-    # num_imgs = valid_map.shape[0]
-    # row = int(math.ceil(math.sqrt(num_imgs)))
-    # fig, axs = plt.subplots(row, row, figsize=(row*6, row*6))
-    # for i, img in enumerate(valid_map):
-    #     j, k = divmod(i, row)
-    #     axs[j,k].imshow(valid_map[i].detach().cpu().numpy())
+    # plt.imshow(valid_map[0].detach().cpu().numpy())
     # plt.show()
-    # valid_map.sum().backward(inputs=(R,t,opa_scaling)) # temp test
-    # print('R grad:', R.grad)
-    # print('t grad:', t.grad)
-    # print('op grad:', opa_scaling)
+    # # num_imgs = valid_map.shape[0]
+    # # row = int(math.ceil(math.sqrt(num_imgs)))
+    # # fig, axs = plt.subplots(row, row, figsize=(row*6, row*6))
+    # # for i, img in enumerate(valid_map):
+    # #     j, k = divmod(i, row)
+    # #     axs[j,k].imshow(valid_map[i].detach().cpu().numpy())
+    # # plt.show()
+    # # valid_map.sum().backward(inputs=(R,t,opa_scaling)) # temp test
+    # # print('R grad:', R.grad)
+    # # print('t grad:', t.grad)
+    # # print('op grad:', opa_scaling)
     # pass
 
     query = 'pikachu'
@@ -89,7 +90,7 @@ if __name__ == "__main__":
     tensor_kwargs={'device':device,'dtype':torch.float32}
 
     num_iter = 250
-    jitter_sigma = 10.
+    jitter_sigma = 100.
     render_cycle = 5
     render_dir = './output/lzson'
 

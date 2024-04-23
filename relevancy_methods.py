@@ -57,7 +57,8 @@ class TestPipeline(torch.nn.Module):
         # return self.cos_similarity_comp(query, R, t, opa_scaling=opa_scaling,
         #                                 pipeline_params=pipeline_params, override_color=override_color,
         #                                 decode_batchsize=decode_batchsize)
-        return self.render_random_views(5, pipeline_params, override_color)
+        return self.render_random_views(5, opa_scaling, 
+                                        pipeline_params=pipeline_params, override_color=override_color)
     
     def cos_similarity_comp(self, query: str, R: torch.Tensor, t: torch.Tensor,
                             pipeline_params: PipelineParams,
@@ -146,6 +147,7 @@ class TestPipeline(torch.nn.Module):
         # # return view_rotations, (view_rotations @ t[...,None]).squeeze(-1)
     
     def render_random_views(self, num_views,
+                            opa_scaling: Optional[torch.Tensor],
                             pipeline_params: PipelineParams,
                             override_color=None):
         Rs, ts = self.random_select_views(num_views)
@@ -153,7 +155,7 @@ class TestPipeline(torch.nn.Module):
          # pin reference
         clip_encoder = self.root_pipeline.clip_encoder
         # render gaussian and keep features only
-        rgb_img, _, _, _ = self.root_pipeline(Rs, ts,
+        rgb_img, _, _, _ = self.root_pipeline(Rs, ts, opa_scaling=opa_scaling,
                                               pipeline_params=pipeline_params,
                                               override_color=override_color) #(B,H,W,3)
 
