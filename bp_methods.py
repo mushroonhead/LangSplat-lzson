@@ -2,6 +2,7 @@
 Stores all belief propagation methods
 """
 
+import numpy as np
 import torch
 from torchvision.transforms.v2 import RandomCrop
 from torchvision.transforms.v2.functional import to_pil_image
@@ -20,6 +21,16 @@ import gc
 from scene.cameras import Camera
 from root_pipeline import RootPipeline
 from arguments import PipelineParams
+from simple_knn._C import distCUDA2
+from utils.spatial_tensor_utils import transform_inv, rot_cam_look_at, quat_2_rot
+
+def scale_rot_2_scale_tril(rot: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    scale = scale.diag_embed()
+    rot = quat_2_rot(rot)
+    H = rot.double() @ rot.double()
+    L = torch.linalg.cholesky(H @ H.transpose(-1,-2))
+
+    return L.float()
 
 def gaussian_cdf(samples: torch.Tensor, alpha: float,
                  epsilon: float) -> torch.Tensor:
@@ -86,6 +97,24 @@ def create_graph(query: str,
     # graph structure
     edge_ids = []
     unary_factors = [OpacityScalingUnary(
+        query, root_pipeline, pipeline_params,
+        tensor_kwargs=tensor_kwargs, **unary_params
+    )]
+    edge_factors = None
+
+    # generate mrf grpah
+    graph = MRFGraph(num_nodes=1, edges=edge_ids,
+                        edge_factors=edge_factors, unary_factors=unary_factors)
+    
+    return graph
+
+def create_graph2(query: str,
+                 root_pipeline: RootPipeline, pipeline_params: PipelineParams,
+                 unary_params: dict,
+                 tensor_kwargs: dict) -> MRFGraph:
+    # graph structure
+    edge_ids = []
+    unary_factors = [Viewpoint3DUnary(
         query, root_pipeline, pipeline_params,
         tensor_kwargs=tensor_kwargs, **unary_params
     )]
@@ -400,3 +429,199 @@ class OpaScalingSVBP(object):
                 pil_img.save(os.path.join(render_dir,f'rgb_{iter:3d}.png'), format='PNG')
             
         return final_opa_scaling
+    
+
+class Viewpoint3DUnary(UnaryFactor):
+    def __init__(self, query: str,
+                 root_pipeline: RootPipeline,
+                 pipeline_params: PipelineParams,
+                 num_views : int = 4, decode_batchsize: int = 16,
+                 alpha: Real = 1,
+                 tensor_kwargs = {'device':'cpu', 'dtype':torch.float32}) -> None:
+        super().__init__(alpha)
+        self.root_pipeline = root_pipeline
+        self.pipeline_params = pipeline_params
+        self.num_views = num_views
+        self.decode_batchsize = decode_batchsize
+        self.tensor_kwargs = tensor_kwargs
+        with torch.no_grad():
+            self.text_embbeding = root_pipeline.clip_encoder.encode_text(query).to(**tensor_kwargs) #(512,)
+            # self.neg_embedding = [root_pipeline.clip_encoder.encode_text(neg).to(**tensor_kwargs) for 
+            #                       neg in ['texture']]
+        self._create_pose_distb()
+
+    def _create_pose_distb(self):
+        try:
+            cams = self.root_pipeline.scene.getTrainCameras()
+        except:
+            cams = self.root_pipeline.scene.getTestCameras()
+        _, t = zip(*[transform_inv(cam.R, cam.T) for cam in cams])
+        t = torch.as_tensor(np.stack(t)/2, dtype=torch.float32, device=self.root_pipeline.device)
+        jitter: torch.Tensor = distCUDA2(t)
+        mix = torch.distributions.Categorical(torch.ones(t.shape[0], device=self.root_pipeline.device))
+        comp = torch.distributions.MultivariateNormal(t, jitter.mean() * torch.eye(3, device=self.root_pipeline.device))
+        self.pose_distrb = torch.distributions.MixtureSameFamily(mix, comp)
+
+    def log_likelihood(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        - Inputs:
+            - x: (K,3) tensor, xyz position
+        - Returns:
+            - log_prob: (K,) tensor
+        """
+        # generate random view
+        _, low_feature = self.render_different_views(x)
+
+        # center crop the features
+        low_feature = self.center_crop(low_feature)
+
+        # cosine comparisons
+        val = self.cos_similarity_comp(low_feature, self.text_embbeding) #(num_particles,num_views,H,W)
+
+        # score calculations
+        score = val.sum(dim=(-1,-2,-3))
+        
+        return score
+    
+    def generate_random_viewpts(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        - Inputs:
+            - x: (K,3) tensor, xyz
+        - Returns:
+            - R: (K,N,3,3) tensor
+            - t: (K,N,3) tensor
+        """
+        K = x.shape[0]
+        # sample cam poses
+        sampled_cam_poses = self.pose_distrb.sample((K,self.num_views,)) # (num_particles,num_views,3)
+        # find rotation to use for rendering
+        view_rotations = torch.linalg.inv(rot_cam_look_at(sampled_cam_poses, x[:,None,:])) # (num_particles,num_views,3,3)
+        return transform_inv(view_rotations, sampled_cam_poses)
+    
+    def render_different_views(self, x: torch.Tensor):
+        Rs, ts = self.generate_random_viewpts(x)
+
+        # render gaussian and keep features only
+        rgb_img, encoded_lang_feat, _, _ = self.root_pipeline(
+            Rs, ts, opa_scaling=None,
+            pipeline_params=self.pipeline_params,
+            override_color=None) #(B,H,W,3)
+
+        return rgb_img, encoded_lang_feat
+    
+    def center_crop(self, img: torch.Tensor, size: int) -> torch.Tensor:
+        """
+        - Inputs:
+            - img: (...,H,W,dim) image like object
+        - Returns:
+            - cropped: (...,size,size,dim) cropped img
+        """
+        full = img.shape[-3:-1]
+        half = torch.tensor(full) * 0.5
+        start = (half - 0.5 * size).round().int()
+        end = (half + 0.5 * size).round().int()
+
+        return img[...,start[0]:end[0],start[1]:end[1],:]
+    
+    def cos_similarity_comp(self, patch_features: torch.Tensor,
+                            text_embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Runs 
+        """
+        # pin reference
+        autoencoder = self.root_pipeline.autoencoder
+       
+        # decoding, allow splitting due to large memory size
+        full_batch_size = patch_features.shape[:-3]
+        patch_features = patch_features.reshape(-1, *patch_features.shape[-3:]) #(B,H,W,3)
+        val_map = []
+        flattened_dim_len = patch_features.shape[0]
+        for start_ind in range(0,patch_features.shape[0],self.decode_batchsize):
+            end_ind = min(start_ind+self.decode_batchsize, flattened_dim_len)
+            decoded_lang_feat = autoencoder.decode(patch_features[start_ind:end_ind,...]).to(**self.tensor_kwargs) #(B,H,W,)
+            if decoded_lang_feat.dim == 3:
+                decoded_lang_feat = decoded_lang_feat.unsqueeze(0) # (B,H,W,512)
+            val_map.append((decoded_lang_feat[...,None,:] @ text_embedding[...,None,None,:,None]).squeeze(-1,-2)) # (B,H,W)
+        
+        output = torch.cat(val_map, dim=0)
+        return output.view(*full_batch_size, *output.shape[-2:]) #(num_particles,num_views,H,W)
+    
+
+class View3DSVBP(object):
+    def __init__(self,
+                 query: str, num_particles: int, 
+                 root_pipeline: RootPipeline, pipeline_params: PipelineParams,
+                 unary_params: dict, init_sigma: float,
+                 kernel: Kernel, 
+                 optim_type: type, optim_kwargs: dict,
+                 tensor_kwargs: dict) -> None:
+        self.root_pipeline = root_pipeline
+        self.pipeline_params = pipeline_params
+        self.tensor_kwargs = tensor_kwargs
+        # create graph first
+        self.graph = create_graph2(
+            query=query, 
+            root_pipeline=root_pipeline, pipeline_params=pipeline_params,
+            unary_params=unary_params, tensor_kwargs=tensor_kwargs)
+        # create distrb of gaussian splats for sampling
+        self.create_gaussian_distb()
+
+        # create bp solver
+        self.solver = self.create_bp(
+            self.graph, root_pipeline=root_pipeline,
+            num_particles=num_particles, init_sigma=init_sigma,
+            kernel=kernel,
+            optim_type=optim_type, optim_kwargs=optim_kwargs,
+            tensor_kwargs=tensor_kwargs)
+
+    def create_gaussian_distb(self):
+        gaussians = self.root_pipeline.gaussian
+        gaussian_pos = gaussians.get_xyz
+        gaussian_scale_tril = scale_rot_2_scale_tril(gaussians.get_rotation, gaussians.get_scaling)
+        mix = torch.distributions.Categorical(torch.ones(gaussian_pos.shape[0], device=self.root_pipeline.device))
+        comp = torch.distributions.MultivariateNormal(gaussian_pos, scale_tril=gaussian_scale_tril)
+        self.gaussian_distrb = torch.distributions.MixtureSameFamily(mix, comp)
+
+    def create_bp(self, mrf_graph: MRFGraph,
+                  root_pipeline: RootPipeline, 
+                  num_particles: int, init_sigma: float,
+                  kernel: Kernel, 
+                  optim_type: type, optim_kwargs: dict,
+                  tensor_kwargs: dict) -> LoopySVBP:
+        # particle bp
+        init_particles = self.gaussian_distrb.sample((num_particles,)).unsqueeze(0) # node 0 particles
+        solver = LoopySVBP(particles=init_particles, graph=mrf_graph,
+                           kernel=kernel, msg_init_mode="uniform",
+                           optim_type=optim_type, optim_kwargs=optim_kwargs, 
+                           tensor_kwargs=tensor_kwargs)
+        
+        return solver
+    
+    def run_solver(self, num_iters: int, msg_pass_per_iter: int,
+                   render_cycle: Optional[int], render_dir: Optional[Path]) -> Tuple[torch.Tensor]:
+        
+        # check if need theres location to render
+        if render_cycle is not None and render_dir is None:
+            warnings.warn('Render dir is not defined even when render cycle is defined. No image will be rendered!')
+            render_cycle = None
+
+        # pass in a memory clearing code
+        def clear_mem(solver: LoopySVBP, iter: int) -> None:
+            if iter % 5 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        # solver with render if requested
+        if render_cycle is None:
+            particles, weights = self.solver.solve(num_iters=num_iters, msg_pass_per_iter=msg_pass_per_iter,
+                                                   iter_fn=clear_mem, return_weights=True)
+        else:
+            for iter in range(0, num_iters, render_cycle):
+                num_iter_this_cycle = min(render_cycle, num_iters - iter)
+                particles, weights = self.solver.solve(num_iters=num_iter_this_cycle, msg_pass_per_iter=msg_pass_per_iter, 
+                                                       iter_fn=clear_mem, return_weights=True)
+                rgb_imgs, _ = self.render_different_views(particles[weights.argmax()])
+                pil_img = to_pil_image(rgb_imgs[0].permute(2,0,1).detach().cpu())
+                pil_img.save(os.path.join(render_dir,f'rgb_{iter:3d}.png'), format='PNG')
+            
+        return particles, weights
