@@ -6,13 +6,13 @@ import numpy as np
 import torch
 from torchvision.transforms.v2 import RandomCrop
 from torchvision.transforms.v2.functional import to_pil_image
-from torch_bp.graph.factors import UnaryFactor
+from torch_bp.graph.factors import UnaryFactor, PairwiseFactor
 from torch_bp.inference.kernels import Kernel
 from torch_bp.graph import MRFGraph
 from torch_bp.bp.particle_bp import ParticleBP
 from torch_bp.bp.svbp import LoopySVBP
 from numbers import Real
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Iterable
 from pathlib import Path
 import warnings
 import os
@@ -88,23 +88,27 @@ def particles_weight_2_final_scale(particles: torch.Tensor, weights: torch.Tenso
 
     # actual prob calculation
     scaling = (scaling * weights[...,None]).sum(-2) # (...,N)
-    return torch.ones_like(scaling) * (scaling > 0.7) # * (scaling > 0.9)
+    return torch.ones_like(scaling) * (scaling > 0.85) # * (scaling > 0.9)
 
-def create_graph(query: str,
+def create_graph(queries: Iterable[str], relations: Optional[Iterable],
                  root_pipeline: RootPipeline, pipeline_params: PipelineParams,
                  unary_params: dict,
                  tensor_kwargs: dict) -> MRFGraph:
     # graph structure
-    edge_ids = []
     unary_factors = [OpacityScalingUnary(
         query, root_pipeline, pipeline_params,
         tensor_kwargs=tensor_kwargs, **unary_params
-    )]
-    edge_factors = None
+    ) for query in queries]
+    if relations is not None:
+        edge_ids = [(i,j) for (_,i,j) in relations]
+        edge_factors = [OpacityScalingISPairwise(1e3) for (_,i,j) in relations]
+    else:
+        edge_ids = []
+        edge_factors = None
 
     # generate mrf grpah
-    graph = MRFGraph(num_nodes=1, edges=edge_ids,
-                        edge_factors=edge_factors, unary_factors=unary_factors)
+    graph = MRFGraph(num_nodes=len(queries), edges=edge_ids,
+                     edge_factors=edge_factors, unary_factors=unary_factors)
     
     return graph
 
@@ -213,7 +217,7 @@ class OpacityScalingUnary(UnaryFactor):
         cut_off = value_maps.view(*batch_shape, -1).topk(self.top_k, dim=-1, sorted=False)[0].min(dim=-1)[0] #(num_particles)
         above_cutoff = value_maps >= cut_off[:,None,None,None]
         above_0 = value_maps.abs() > 1e-3
-        score = (value_maps * above_cutoff - 1e-2 * value_maps.abs() * ~above_cutoff * above_0).sum(dim=(-1,-2,-3))
+        score = (value_maps * above_cutoff - 1e2 * value_maps.abs() * ~above_cutoff * above_0).sum(dim=(-1,-2,-3))
 
         return -score
 
@@ -284,7 +288,33 @@ class OpacityScalingUnary(UnaryFactor):
         
         output = torch.cat(val_map, dim=0)
         return output.view(*full_batch_size, *output.shape[-2:])
+    
 
+class OpacityScalingISPairwise(PairwiseFactor):
+    def __init__(self, alpha: Real = 1) -> None:
+        super().__init__(alpha)
+
+    def log_likelihood(self, x_s: torch.Tensor, x_t: torch.Tensor) -> torch.Tensor:
+        """
+        - Inputs:
+            - x_s: (K1,N) tensor
+            - x_t: (K2,N) tensor
+        - Returns:
+            - eval: (K1,K2) tensor
+        """
+        N = x_s.shape[-1]
+        batch_xs = x_s.shape[:-1]
+        batch_xt = x_t.shape[:-1]
+        x_s = x_s.view(-1, N)
+        x_t = x_t.view(-1, N)
+
+        # temp use something similar to kl div
+        x_s = torch.nn.functional.log_softmax(x_s, dim=-1) # (K1,N)
+        x_t = torch.nn.functional.log_softmax(x_t, dim=-1) # (K2,N)
+        score = (x_s[:,None,...].exp() * (x_s[:,None,:] - x_t[None,:,:])).sum(-1)
+
+        score = score.view(*batch_xs,*batch_xt)
+        return score
 
 class OpaScalingParticleBP(object):
     def __init__(self, 
@@ -297,7 +327,7 @@ class OpaScalingParticleBP(object):
         self.tensor_kwargs = tensor_kwargs
         # create graph first
         self.graph = create_graph(
-            query=query, 
+            queries=query, 
             root_pipeline=root_pipeline, pipeline_params=pipeline_params,
             unary_params=unary_params, tensor_kwargs=tensor_kwargs)
         # create bp solver
@@ -314,7 +344,7 @@ class OpaScalingParticleBP(object):
         num_gaussians = root_pipeline.gaussian.get_xyz.shape[0]
 
         # particle bp
-        init_particles = init_sigma * torch.randn(1, num_particles, num_gaussians, **tensor_kwargs)
+        init_particles = init_sigma * torch.randn(mrf_graph.N, num_particles, num_gaussians, **tensor_kwargs)
         particle_bp = ParticleBP(init_particles=init_particles, graph=mrf_graph,
                                  sample_mode="nodes", tensor_kwargs=tensor_kwargs)
         
@@ -356,7 +386,8 @@ class OpaScalingParticleBP(object):
 
 class OpaScalingSVBP(object):
     def __init__(self,
-                 query: str, num_particles: int, 
+                 queries: Iterable[str], relations: Optional[Iterable],  
+                 num_particles: int, 
                  root_pipeline: RootPipeline, pipeline_params: PipelineParams,
                  unary_params: dict, init_sigma: float,
                  kernel: Kernel, 
@@ -367,7 +398,7 @@ class OpaScalingSVBP(object):
         self.tensor_kwargs = tensor_kwargs
         # create graph first
         self.graph = create_graph(
-            query=query, 
+            queries=queries, relations=relations,
             root_pipeline=root_pipeline, pipeline_params=pipeline_params,
             unary_params=unary_params, tensor_kwargs=tensor_kwargs)
         # create bp solver
@@ -388,7 +419,7 @@ class OpaScalingSVBP(object):
         num_gaussians = root_pipeline.gaussian.get_xyz.shape[0]
 
         # particle bp
-        init_particles = init_sigma * torch.randn(1, num_particles, num_gaussians, **tensor_kwargs)
+        init_particles = init_sigma * torch.randn(mrf_graph.N, num_particles, num_gaussians, **tensor_kwargs)
         solver = LoopySVBP(particles=init_particles, graph=mrf_graph,
                            kernel=kernel, msg_init_mode="uniform",
                            optim_type=optim_type, optim_kwargs=optim_kwargs, 
