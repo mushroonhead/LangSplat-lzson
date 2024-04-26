@@ -46,7 +46,7 @@ class TestPipeline(torch.nn.Module):
                  *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.root_pipeline = root_pipeline
-        # self.create_pose_distb()
+        self.create_pose_distb()
         # self.create_gaussian_distb()
 
     def forward(self, query: str, R: torch.Tensor, t: torch.Tensor,
@@ -54,11 +54,11 @@ class TestPipeline(torch.nn.Module):
                 opa_scaling: Optional[torch.Tensor] = None,
                 override_color = None,
                 decode_batchsize=1):
-        return self.cos_similarity_comp(query, R, t, opa_scaling=opa_scaling,
-                                        pipeline_params=pipeline_params, override_color=override_color,
-                                        decode_batchsize=decode_batchsize)
-        # return self.render_random_views(5, opa_scaling, 
-        #                                 pipeline_params=pipeline_params, override_color=override_color)
+        # return self.cos_similarity_comp(query, R, t, opa_scaling=opa_scaling,
+        #                                 pipeline_params=pipeline_params, override_color=override_color,
+        #                                 decode_batchsize=decode_batchsize)
+        return self.render_random_views(5, opa_scaling, 
+                                        pipeline_params=pipeline_params, override_color=override_color)
     
     def cos_similarity_comp(self, query: str, R: torch.Tensor, t: torch.Tensor,
                             pipeline_params: PipelineParams,
@@ -95,7 +95,7 @@ class TestPipeline(torch.nn.Module):
             cams = self.root_pipeline.scene.getTrainCameras()
         except:
             cams = self.root_pipeline.scene.getTestCameras()
-        _, t = zip(*[(cam.R, cam.T) for cam in cams])
+        _, t = zip(*[transform_inv(cam.R, cam.T) for cam in cams])
         t = torch.as_tensor(np.stack(t)/2, dtype=torch.float32, device=self.root_pipeline.device)
         jitter: torch.Tensor = distCUDA2(t)
         mix = torch.distributions.Categorical(torch.ones(t.shape[0], device=self.root_pipeline.device))
@@ -111,40 +111,16 @@ class TestPipeline(torch.nn.Module):
         self.gaussian_distrb = torch.distributions.MixtureSameFamily(mix, comp)
     
     def random_select_views(self, num_views):
-        R, t = zip(*[(self.root_pipeline.scene.getTrainCameras()[0].R, self.root_pipeline.scene.getTrainCameras()[0].T) for _ in range(5)])
-        # R, t = zip(*[(cam.R, cam.T) for cam in self.root_pipeline.scene.getTrainCameras()])
-        R = torch.tensor(np.stack(R), dtype=torch.float32, device=self.root_pipeline.device)
-        t = torch.tensor(np.stack(t), dtype=torch.float32, device=self.root_pipeline.device)
-        # t = (R.transpose(-1,-2) @ t[...,None]).squeeze(-1)
-        return R, t
-        # cam = self.root_pipeline.scene.getTrainCameras()[0]
-        # sampled_ts = self.pose_distrb.sample((num_views,))
-        # sampled_render_pt = self.gaussian_distrb.sample()
-        # size = torch.linalg.norm(self.root_pipeline.gaussian.get_scaling, dim=-1)
-        # pos = (self.root_pipeline.gaussian.get_xyz)[size > 1e-3]
-        # sampled_render_pt = (pos.max(dim=0)[0] + pos.min(dim=0)[0])/2
-        # sampled_render_pt = self.root_pipeline.gaussian.get_xyz.mean(dim=0)
-        # sampled_render_pt = torch.tensor([0.5,0.5,7.5], device=self.root_pipeline.device, dtype=torch.float32)
-        # rand_rots = rand_rot(25, device=self.root_pipeline.device)
-        # delta_trans = torch.tensor([0.,0.,0.], device=self.root_pipeline.device)
-        # view_rotations = rand_rots
-        # t = rand_rots @ sampled_render_pt + delta_trans
-        # view_rotations = rot_cam_look_at(sampled_render_pt[None,:], sampled_ts)
-        # view_rotations = rot_cam_look_at(sampled_render_pt[None,:], t)
-        # view_rotations = view_rotations.transpose(-1,-2)
-        # d = 8e-1 * torch.randn(5, device='cuda', dtype=torch.float32)
-        # temp = torch.stack(
-        #     (torch.stack((d.cos(), d.sin(), torch.zeros_like(d)), dim=-1),
-        #      torch.stack((-d.sin(), d.cos(), torch.zeros_like(d)), dim=-1),
-        #      torch.cat((torch.zeros(5,2, device='cuda', dtype=torch.float32), torch.ones(5,1, device='cuda', dtype=torch.float32)), dim=-1)), dim=-2)
-        # t = t + 0.5 * torch.randn(5, 3, device='cuda', dtype=torch.float32)
-        # t = t +  2 * torch.arange(5, device='cuda', dtype=torch.float32)
-        # view_rotations = R
-        # view_rotations = temp @ R
+        # sample cam poses
+        sampled_cam_poses = self.pose_distrb.sample((num_views,))
+        # sample pts to render
+        size = torch.linalg.norm(self.root_pipeline.gaussian.get_scaling, dim=-1)
+        pos = (self.root_pipeline.gaussian.get_xyz)[size > 1e-3]
+        sampled_render_pt = (pos.max(dim=0)[0] + pos.min(dim=0)[0])/2
+        # find rotation to use for rendering
+        view_rotations = torch.linalg.inv(rot_cam_look_at(sampled_cam_poses, sampled_render_pt[None,:]))
+        return transform_inv(view_rotations, sampled_cam_poses)
 
-        # view_rotations = rot_cam_look_at(torch.tensor(cam.T[None,:], dtype=torch.float32, device='cuda'), sampled_ts)
-        # return view_rotations, t
-        # # return view_rotations, (view_rotations @ t[...,None]).squeeze(-1)
     
     def render_random_views(self, num_views,
                             opa_scaling: Optional[torch.Tensor],
