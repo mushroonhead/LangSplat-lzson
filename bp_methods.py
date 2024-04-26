@@ -6,10 +6,12 @@ import torch
 from torchvision.transforms.v2 import RandomCrop
 from torchvision.transforms.v2.functional import to_pil_image
 from torch_bp.graph.factors import UnaryFactor
+from torch_bp.inference.kernels import Kernel
 from torch_bp.graph import MRFGraph
 from torch_bp.bp.particle_bp import ParticleBP
+from torch_bp.bp.svbp import LoopySVBP
 from numbers import Real
-from typing import Optional
+from typing import Optional, Tuple
 from pathlib import Path
 import warnings
 import os
@@ -19,8 +21,8 @@ from scene.cameras import Camera
 from root_pipeline import RootPipeline
 from arguments import PipelineParams
 
-def gaussian_cdf(samples: torch.Tensor,
-                 epsilon: float=1e-4) -> torch.Tensor:
+def gaussian_cdf(samples: torch.Tensor, alpha: float,
+                 epsilon: float) -> torch.Tensor:
     """
     Converts a sample of data into a gaussian cdf set
     - Inputs:
@@ -29,19 +31,21 @@ def gaussian_cdf(samples: torch.Tensor,
     - Returns:
         - cdf: (N,) tensor, 0~1.0
     """
-    return torch.distributions.Normal(samples.mean(), samples.cov().clamp(min=epsilon)).cdf(samples)
+    return torch.distributions.Normal(samples.mean(), alpha*samples.cov().clamp(min=epsilon)).cdf(samples)
 
-def batched_gaussian_cdf(samples: torch.Tensor,
+def batched_gaussian_cdf(samples: torch.Tensor, alpha: float=0.05**2,
                          epsilon: float=1e-4) -> torch.Tensor:
     """
     Naive loop based gaussian cdf for now (not vamppable)
     - Inputs:
         - samples: (B,N) tensor -inf~inf
+        - alpha: float, 
         - epsilon: float, small positive val to ensure cov is always +ve
     - Returns:
         - cdf: (B,N) tensor, 0~1.0
     """
-    return torch.stack([gaussian_cdf(sample, epsilon) for sample in samples], dim=0)
+    return torch.stack([gaussian_cdf(sample, alpha=alpha, epsilon=epsilon) for sample in samples], dim=0)
+
 
 def particles_weight_2_final_scale(particles: torch.Tensor, weights: torch.Tensor,
                                    epsilon: float=1e-4) -> torch.Tensor:
@@ -54,20 +58,56 @@ def particles_weight_2_final_scale(particles: torch.Tensor, weights: torch.Tenso
     - Returns:
         - final_scale: (...,N) tensor, 0~1.0
     """
+    # best = weights.argmax()
+    # scaling = particles[:, best,...].sigmoid() # batched_gaussian_cdf(particles[:, best,...], alpha=1.0, epsilon=epsilon) #(B,N)
+
+    # return scaling
+
     # reshape
     batch_shape = particles.shape[:-2] 
     K, N = particles.shape[-2:]
     particles = particles.view(-1,N) #(B,N)
 
     # normalize
-    scaling = batched_gaussian_cdf(particles, epsilon) #(B,N)
-    weights = torch.nn.functional.normalize(weights, dim =-1) #(...,K)
+    scaling = particles.sigmoid() # batched_gaussian_cdf(particles, alpha=1.0, epsilon=epsilon) #(B,N)
+    weights = torch.nn.functional.softmax(weights, dim =-1) #(...,K)
 
     # shape back
     scaling = scaling.view(*batch_shape,K,N) # (...,K,N)
 
     # actual prob calculation
-    return (scaling * weights[...,None]).sum(-2) # (...,N)
+    scaling = (scaling * weights[...,None]).sum(-2) # (...,N)
+    return torch.ones_like(scaling) * (scaling > 0.7) # * (scaling > 0.9)
+
+def create_graph(query: str,
+                 root_pipeline: RootPipeline, pipeline_params: PipelineParams,
+                 unary_params: dict,
+                 tensor_kwargs: dict) -> MRFGraph:
+    # graph structure
+    edge_ids = []
+    unary_factors = [OpacityScalingUnary(
+        query, root_pipeline, pipeline_params,
+        tensor_kwargs=tensor_kwargs, **unary_params
+    )]
+    edge_factors = None
+
+    # generate mrf grpah
+    graph = MRFGraph(num_nodes=1, edges=edge_ids,
+                        edge_factors=edge_factors, unary_factors=unary_factors)
+    
+    return graph
+
+def render_rgb(opa_scaling: torch.Tensor,
+               root_pipeline: RootPipeline, pipeline_params: PipelineParams,
+               tensor_kwargs: dict) -> torch.Tensor:
+    # for now select only the first view
+    cam: Camera = root_pipeline.scene.getTrainCameras()[0]
+    R: torch.Tensor = torch.tensor(cam.R, **tensor_kwargs) # (3,3)
+    t: torch.Tensor = torch.tensor(cam.T, **tensor_kwargs) # (3,)
+    rgb_img, _, _, _ = root_pipeline(R, t, opa_scaling=opa_scaling,
+                                        pipeline_params=pipeline_params,
+                                        override_color=None) #(H,W,3) # how to override
+    return rgb_img
 
 
 class OpacityScalingUnary(UnaryFactor):
@@ -79,7 +119,7 @@ class OpacityScalingUnary(UnaryFactor):
                  num_patches : int = 4, patch_size: int = 256,
                  decode_batchsize: int = 1,
                  override_color: Optional[torch.Tensor] = None,
-                 beta: Real = 0.5, top_k: int = 64,
+                 beta: Real = 0.5, top_k: int = 256,
                  alpha: Real = 1, 
                  tensor_kwargs = {'device':'cpu', 'dtype':torch.float32}) -> None:
         super().__init__(alpha)
@@ -94,6 +134,8 @@ class OpacityScalingUnary(UnaryFactor):
         self.tensor_kwargs = tensor_kwargs
         with torch.no_grad():
             self.text_embbeding = root_pipeline.clip_encoder.encode_text(query).to(**tensor_kwargs) #(512,)
+            self.neg_embedding = [root_pipeline.clip_encoder.encode_text(neg).to(**tensor_kwargs) for 
+                                  neg in ['texture']]
 
 
     def log_likelihood(self, opa_scaling: torch.Tensor) -> torch.Tensor:
@@ -122,22 +164,29 @@ class OpacityScalingUnary(UnaryFactor):
             - log_prob: (K,) tensor
         """
         # first make incoming opacity scale 
-        opa_scaling_adj = batched_gaussian_cdf(opa_scaling.squeeze(-1)).unsqueeze(-1)
+        opa_scaling_adj = opa_scaling.sigmoid().unsqueeze(-1) # batched_gaussian_cdf(opa_scaling.squeeze(-1), alpha=1.0).unsqueeze(-1)
         # render gaussian and keep features only
         _, encoded_lang_feat, _, _ = self.root_pipeline(R, t, opa_scaling=opa_scaling_adj,
                                                         pipeline_params=self.pipeline_params,
-                                                        override_color=self.override_color) #(...,H,W,3)
+                                                        override_color=self.override_color) # (num_particles, height, width, comp_features_dim)
         # for each batch, take n patches
-        patches = self.patch_sample_2d(encoded_lang_feat, self.num_patches, self.patch_size)
+        patches = self.patch_sample_2d(encoded_lang_feat, self.num_patches, self.patch_size) # (num_particles, num_samples, height, width, comp_features_dim)
         # batch cos_similarity comparison
-        value_maps = self.cos_similarity_comp(patches) #(...,H,W)
+        value_maps = self.cos_similarity_comp(patches, self.text_embbeding) #(num_particles, num_samples, height, width)
         # final score
-        batch_shape = value_maps.shape[:-2]
-        score = ((1 - self.beta)*value_maps.mean(dim=(-1,-2)) + # mean of the entire map
-                 self.beta*value_maps.view(*batch_shape, -1).topk(self.top_k, dim=-1, sorted=False)[0].mean(dim=-1)) # promote better performing 
-                                                                                                      # pixels to perform better
+        batch_shape = value_maps.shape[:-3]
+        # score = ((1 - self.beta)*value_maps.mean(dim=(-1,-2,-3)) + # mean of the entire map and across samples
+        #          self.beta*value_maps.view(*batch_shape, -1).topk(self.top_k, dim=-1, sorted=False)[0].mean(dim=-1)) # promote better performing 
+        #                                                                                               # pixels to perform better
+        neg_maps = torch.stack([self.cos_similarity_comp(patches, neg_emb) for neg_emb in self.neg_embedding]).max(dim=0)[0]
+        value_maps = torch.nn.functional.softmax(torch.stack([value_maps, neg_maps]), dim=0)[0]
+        
+        cut_off = value_maps.view(*batch_shape, -1).topk(self.top_k, dim=-1, sorted=False)[0].min(dim=-1)[0] #(num_particles)
+        above_cutoff = value_maps >= cut_off[:,None,None,None]
+        above_0 = value_maps.abs() > 1e-3
+        score = (value_maps * above_cutoff - 1e-2 * value_maps.abs() * ~above_cutoff * above_0).sum(dim=(-1,-2,-3))
 
-        return score.mean(dim=-1) # mean across views
+        return -score
 
     def full_grad_log_likelihood(self, R: torch.Tensor, t: torch.Tensor,
                                  opa_scaling: torch.Tensor) -> torch.Tensor:
@@ -184,7 +233,8 @@ class OpacityScalingUnary(UnaryFactor):
 
         return patches
 
-    def cos_similarity_comp(self, patch_features: torch.Tensor) -> torch.Tensor:
+    def cos_similarity_comp(self, patch_features: torch.Tensor,
+                            text_embedding: torch.Tensor) -> torch.Tensor:
         """
         Runs 
         """
@@ -201,7 +251,7 @@ class OpacityScalingUnary(UnaryFactor):
             decoded_lang_feat = autoencoder.decode(patch_features[start_ind:end_ind,...]).to(**self.tensor_kwargs) #(B,H,W,)
             if decoded_lang_feat.dim == 3:
                 decoded_lang_feat = decoded_lang_feat.unsqueeze(0) # (B,H,W,512)
-            val_map.append((decoded_lang_feat[...,None,:] @ self.text_embbeding[...,None,None,:,None]).squeeze(-1,-2)) # (B,H,W)
+            val_map.append((decoded_lang_feat[...,None,:] @ text_embedding[...,None,None,:,None]).squeeze(-1,-2)) # (B,H,W)
         
         output = torch.cat(val_map, dim=0)
         return output.view(*full_batch_size, *output.shape[-2:])
@@ -217,7 +267,7 @@ class OpaScalingParticleBP(object):
         self.pipeline_params = pipeline_params
         self.tensor_kwargs = tensor_kwargs
         # create graph first
-        self.graph = self.create_graph(
+        self.graph = create_graph(
             query=query, 
             root_pipeline=root_pipeline, pipeline_params=pipeline_params,
             unary_params=unary_params, tensor_kwargs=tensor_kwargs)
@@ -226,24 +276,6 @@ class OpaScalingParticleBP(object):
             self.graph, root_pipeline=root_pipeline,
             num_particles=num_particles, init_sigma=init_sigma,
             tensor_kwargs=tensor_kwargs)
-
-    def create_graph(self, query: str,
-                     root_pipeline: RootPipeline, pipeline_params: PipelineParams,
-                     unary_params: dict,
-                     tensor_kwargs: dict) -> MRFGraph:
-        # graph structure
-        edge_ids = []
-        unary_factors = [OpacityScalingUnary(
-            query, root_pipeline, pipeline_params,
-            tensor_kwargs=tensor_kwargs, **unary_params
-        )]
-        edge_factors = None
-
-        # generate mrf grpah
-        graph = MRFGraph(num_nodes=1, edges=edge_ids,
-                         edge_factors=edge_factors, unary_factors=unary_factors)
-        
-        return graph
 
     def create_bp(self, mrf_graph: MRFGraph,
                   root_pipeline: RootPipeline, 
@@ -284,18 +316,87 @@ class OpaScalingParticleBP(object):
                                                        return_weights=True, iter_fn=clear_mem)
                 final_opa_scaling = particles_weight_2_final_scale(particles, weights).unsqueeze(-1)
 
-                rgb_img = self.render_rgb(final_opa_scaling[0]) # only render the first
+                rgb_img = render_rgb(final_opa_scaling[0],
+                                     root_pipeline=self.root_pipeline, pipeline_params=self.pipeline_params, 
+                                     tensor_kwargs=self.tensor_kwargs) # only render the first
                 pil_img = to_pil_image(rgb_img.permute(2,0,1).detach().cpu())
                 pil_img.save(os.path.join(render_dir,f'rgb_{iter:3d}.png'), format='PNG')
             
         return final_opa_scaling
     
-    def render_rgb(self, opa_scaling: torch.Tensor) -> torch.Tensor:
-        # for now select only the first view
-        cam: Camera = self.root_pipeline.scene.getTrainCameras()[0]
-        R: torch.Tensor = torch.tensor(cam.R, **self.tensor_kwargs) # (3,3)
-        t: torch.Tensor = torch.tensor(cam.T, **self.tensor_kwargs) # (3,)
-        rgb_img, _, _, _ = self.root_pipeline(R, t, opa_scaling=opa_scaling,
-                                              pipeline_params=self.pipeline_params,
-                                              override_color=None) #(H,W,3) # how to override
-        return rgb_img
+
+class OpaScalingSVBP(object):
+    def __init__(self,
+                 query: str, num_particles: int, 
+                 root_pipeline: RootPipeline, pipeline_params: PipelineParams,
+                 unary_params: dict, init_sigma: float,
+                 kernel: Kernel, 
+                 optim_type: type, optim_kwargs: dict,
+                 tensor_kwargs: dict) -> None:
+        self.root_pipeline = root_pipeline
+        self.pipeline_params = pipeline_params
+        self.tensor_kwargs = tensor_kwargs
+        # create graph first
+        self.graph = create_graph(
+            query=query, 
+            root_pipeline=root_pipeline, pipeline_params=pipeline_params,
+            unary_params=unary_params, tensor_kwargs=tensor_kwargs)
+        # create bp solver
+        self.solver = self.create_bp(
+            self.graph, root_pipeline=root_pipeline,
+            num_particles=num_particles, init_sigma=init_sigma,
+            kernel=kernel,
+            optim_type=optim_type, optim_kwargs=optim_kwargs,
+            tensor_kwargs=tensor_kwargs)
+        
+    def create_bp(self, mrf_graph: MRFGraph,
+                  root_pipeline: RootPipeline, 
+                  num_particles: int, init_sigma: float,
+                  kernel: Kernel, 
+                  optim_type: type, optim_kwargs: dict,
+                  tensor_kwargs: dict) -> LoopySVBP:
+        # meta data
+        num_gaussians = root_pipeline.gaussian.get_xyz.shape[0]
+
+        # particle bp
+        init_particles = init_sigma * torch.randn(1, num_particles, num_gaussians, **tensor_kwargs)
+        solver = LoopySVBP(particles=init_particles, graph=mrf_graph,
+                           kernel=kernel, msg_init_mode="uniform",
+                           optim_type=optim_type, optim_kwargs=optim_kwargs, 
+                           tensor_kwargs=tensor_kwargs)
+        
+        return solver
+    
+    def run_solver(self, num_iters: int, msg_pass_per_iter: int,
+                   render_cycle: Optional[int], render_dir: Optional[Path]) -> Tuple[torch.Tensor]:
+        
+        # check if need theres location to render
+        if render_cycle is not None and render_dir is None:
+            warnings.warn('Render dir is not defined even when render cycle is defined. No image will be rendered!')
+            render_cycle = None
+
+        # pass in a memory clearing code
+        def clear_mem(solver: LoopySVBP, iter: int) -> None:
+            if iter % 5 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        # solver with render if requested
+        if render_cycle is None:
+            particles, weights = self.solver.solve(num_iters=num_iters, msg_pass_per_iter=msg_pass_per_iter,
+                                                   iter_fn=clear_mem, return_weights=True)
+            final_opa_scaling = particles_weight_2_final_scale(particles, weights)
+        else:
+            for iter in range(0, num_iters, render_cycle):
+                num_iter_this_cycle = min(render_cycle, num_iters - iter)
+                particles, weights = self.solver.solve(num_iters=num_iter_this_cycle, msg_pass_per_iter=msg_pass_per_iter, 
+                                                       iter_fn=clear_mem, return_weights=True)
+                final_opa_scaling = particles_weight_2_final_scale(particles, weights).unsqueeze(-1)
+
+                rgb_img = render_rgb(final_opa_scaling[0],
+                                     root_pipeline=self.root_pipeline, pipeline_params=self.pipeline_params, 
+                                     tensor_kwargs=self.tensor_kwargs) # only render the first
+                pil_img = to_pil_image(rgb_img.permute(2,0,1).detach().cpu())
+                pil_img.save(os.path.join(render_dir,f'rgb_{iter:3d}.png'), format='PNG')
+            
+        return final_opa_scaling

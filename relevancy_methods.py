@@ -54,11 +54,11 @@ class TestPipeline(torch.nn.Module):
                 opa_scaling: Optional[torch.Tensor] = None,
                 override_color = None,
                 decode_batchsize=1):
-        # return self.cos_similarity_comp(query, R, t, opa_scaling=opa_scaling,
-        #                                 pipeline_params=pipeline_params, override_color=override_color,
-        #                                 decode_batchsize=decode_batchsize)
-        return self.render_random_views(5, opa_scaling, 
-                                        pipeline_params=pipeline_params, override_color=override_color)
+        return self.cos_similarity_comp(query, R, t, opa_scaling=opa_scaling,
+                                        pipeline_params=pipeline_params, override_color=override_color,
+                                        decode_batchsize=decode_batchsize)
+        # return self.render_random_views(5, opa_scaling, 
+        #                                 pipeline_params=pipeline_params, override_color=override_color)
     
     def cos_similarity_comp(self, query: str, R: torch.Tensor, t: torch.Tensor,
                             pipeline_params: PipelineParams,
