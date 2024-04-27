@@ -80,7 +80,8 @@ def particles_weight_2_final_scale(particles: torch.Tensor, weights: torch.Tenso
     particles = particles.view(-1,N) #(B,N)
 
     # normalize
-    scaling = particles.sigmoid() # batched_gaussian_cdf(particles, alpha=1.0, epsilon=epsilon) #(B,N)
+    scaling = batched_gaussian_cdf(particles, alpha=0.3, epsilon=epsilon) #(B,N)
+    # scaling = particles.sigmoid()
     weights = torch.nn.functional.softmax(weights, dim =-1) #(...,K)
 
     # shape back
@@ -197,7 +198,8 @@ class OpacityScalingUnary(UnaryFactor):
             - log_prob: (K,) tensor
         """
         # first make incoming opacity scale 
-        opa_scaling_adj = opa_scaling.sigmoid().unsqueeze(-1) # batched_gaussian_cdf(opa_scaling.squeeze(-1), alpha=1.0).unsqueeze(-1)
+        opa_scaling_adj = batched_gaussian_cdf(opa_scaling.squeeze(-1), alpha=1.0).unsqueeze(-1)
+        # opa_scaling_adj = opa_scaling.sigmoid().unsqueeze(-1)
         # render gaussian and keep features only
         _, encoded_lang_feat, _, _ = self.root_pipeline(R, t, opa_scaling=opa_scaling_adj,
                                                         pipeline_params=self.pipeline_params,
